@@ -1,0 +1,281 @@
+---
+title: 'Adipose: QC'
+author: "Mike Morgan"
+output:
+  pdf_document: default
+  html_notebook: default
+---
+
+## Introduction
+Adipocyte precursor cells were sorted from the stromal vascular fraction (SVF) of mouse epidydimal fat pads.  Cells were sorted on either Wt+ or Wt-, split evenly across each of 3 x 384 well plates (a fourth is in the process of sequencing).  Each plate included a 50-cell control and 4 negative control wells.
+
+Paired-end sequencing was performed at the WTSI.  CRAM format files were converted back to FASTQ prior to initial QC using FastQC to check for base calling quality, primer/adaptor contamination and removal.  Generally there was little adaptor or primer contamination, but was removed where present, and reads were quality trimmed to a minimum length 75nts, and only properly paired reads were retained.  Trimmed reads were then aligned to mm10 genome build using STAR, and reads were filtered on a splice junctions database constructed from all transcripts in Ensembl build 86, including the sequences for all ERCC spike in transcripts and the GFP transcript sequence.  Alignments were generally very good, with only a few libraries with low mapping rates (<50%).  Gene expression was quantified overall ERCC transcripts, GFP and Ensembl build 86 transcripts using featureCounts, following deduplication of BAM files.
+
+This document therefore will layout the inital post-alignment QC, before proceeding into the single-cell specific QC.
+
+## Results
+### Alignment statistics summary
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(cache=TRUE)
+```
+
+```{r, echo=FALSE, fig.height=6.5, fig.width=9.5}
+suppressPackageStartupMessages(source("~/Dropbox/R_sessions/QC/mouse_adipose_preQC.R"))
+
+p.alignment <- ggplot(adipose.meta, aes(pct_pf_reads_aligned, fill=as.factor(Plate))) +
+  geom_density(alpha=0.3) + theme_mike() +
+  scale_fill_Publication() +
+  guides(fill=guide_legend(title='Plate')) + 
+  labs(x="Percent Reads Aligned", y="Density")
+
+
+p.dups <- ggplot(adipose.meta, aes(percent_duplication, fill=as.factor(Plate))) +
+  geom_density(alpha=0.3) + theme_mike() +
+  scale_fill_Publication() +
+  guides(fill=guide_legend(title='Plate')) + 
+  labs(x="Duplication Rate", y="Density")
+
+
+p.pcrate <- ggplot(adipose.meta, aes(PC.rate, fill=as.factor(Plate))) +
+  geom_density(alpha=0.3) + theme_mike() +
+  scale_fill_Publication() +
+  guides(fill=guide_legend(title='Plate')) + 
+  labs(x="Protein-coding gene %", y="Density")
+
+
+p.rrna <- ggplot(adipose.meta, aes(rRNA.rate, fill=as.factor(Plate))) +
+  geom_density(alpha=0.3) + theme_mike() +
+  scale_fill_Publication() +
+  guides(fill=guide_legend(title='Plate')) + 
+  labs(x="rRNA genes %", y="Density")
+
+
+p.readlen <- ggplot(adipose.meta, aes(mean_read_length, fill=as.factor(Plate))) +
+  geom_density(alpha=0.3) + theme_mike() +
+  scale_fill_Publication() +
+  guides(fill=guide_legend(title='Plate')) + 
+  labs(x="Mean read length", y="Density")
+
+
+p.insert <- ggplot(adipose.meta, aes(median_insert_size, fill=as.factor(Plate))) +
+  geom_density(alpha=0.3) + theme_mike() +
+  scale_fill_Publication() +
+  guides(fill=guide_legend(title='Plate')) + 
+  labs(x="Median insert size", y="Density")
+
+
+plot_grid(p.alignment, p.dups, p.pcrate, p.rrna, p.readlen, p.insert,
+          labels=c("Alignment Rates", "Duplication Rates", "Protein-coding gene %",
+                   "rRNA %", "Average read lengths", "Median insert sizes"),
+          ncol=3)
+```
+
+Alignment rates are really high across all 3 plates, which is much better quality than I have seen in many other single cell data sets.  Likewise, the duplication rates are suprisingly low, with only a few libraries with > 20% duplicated reads; this is more what I would expect from bulk RNAseq than scRNAseq!  There are a few more libraries with low protein-coding gene coverage, usually a good indicator of poor quality cells.  This is also reflect in the small proportion of cells with more than 30% reads from rRNAs.  There is a curious hump close to 0, perhaps these are just libraries with very low overall content.  The average read lengths look fine, so there is not much heterogeneity there.  The median insert sizes are another matter.  Plates 6 & 7 look like they have a similar spread of insert sizes, even though plate 7 generally has larger by ~200bp.  The higher variance in plate 8 is a bit odd.  The insert size is often a source of variation in single cell RNA seq experiments, and I haven't seen any adverse effects as yet, but it is worth keeping an eye out.  If there are any major batch effects between plates, this might be the source.
+
+Overall I would say these are the best quality single cell RNAseq data I've seen to date.  Let's take a look at the single cell specific QC now.
+
+### Single cell QC summary
+
+First I'll look at any spatial effects across the plates.  I haven't seen any problems previously, but it's better to check, and then account for it in downstream analyses.
+
+```{r, echo=FALSE, fig.height=6.5, fig.width=7.0}
+row.p <- plotPhenoData(sce, aes(y=log10_total_counts,
+                                x=PlateRow,
+                                colour=PlateRow))
+col.p <- plotPhenoData(sce, aes(y=log10_total_counts,
+                                x=PlateColumn,
+                                colour=PlateColumn))
+plot_grid(row.p, col.p,
+          labels=c("Library size by plate row", "Library size by plate column"),
+          nrow=2)
+```
+
+Great, there aren't any obvious spatial effects within these 3 plates.  Now to look for any batch effects between plates, and importantly between the two Wt1+/- populations. 
+
+```{r, echo=FALSE, fig.height=4.5, fig.width=9.5, warnings=FALSE, message=FALSE}
+p.depth <- plotPhenoData(sce, aes(x=Plate,
+                                  y=log10_total_counts,
+                                  colour=Plate)) +
+  scale_colour_Publication()
+
+p.sampletype <- plotPhenoData(sce, aes(x=SampleType,
+                                  y=log10_total_counts,
+                                  colour=SampleType)) +
+  scale_colour_Publication()
+
+
+p.marker <- plotPhenoData(sce, aes(x=Marker,
+                                  y=log10_total_counts,
+                                  colour=Marker)) +
+  scale_colour_Publication()
+
+plot_grid(p.depth, p.sampletype, p.marker,
+          labels=c("Library size by Plate", "Library size by well type", "Library size by GFP marker"),
+          ncol=3)
+```
+
+The left plot shows there is no differences in library sizes between plates, and that the coverage is generally very good with > 100,000 reads in the majority of libraries.  The poor quality libraries are evident as the long tails on these violin plots.  The middle plot shows that most of the empty wells are genuinely empty, but it looks like some of them have a fair amount of material in them.  The right plot shows there is no difference in library size between the GFP positive and negative cells, which is reassuring.
+
+We want to see if the sequencing real estate is spread out across the whole transcriptome of these cells, or if it is dominated by just a few transcripts.  We can do this by looking at the top 500 genes and see how much of each cell's library they account for.  Cells which are dominated by a few transcripts will show steep lines indicating high coverage of just those genes.  Ideally we want libraries that fall into the mid-range, indicating coverage of multiple transcripts.
+
+```{r, echo=FALSE, fig.height=9.5, fig.width=7.5}
+cov.plate <- plotScater(sce, block1="Plate",
+                           colour_by="Plate", nfeatures=500, exprs_values="counts")
+
+cov.type <- plotScater(sce, block1="SampleType",
+              colour_by="SampleType", nfeatures=500, exprs_values="counts")
+
+cov.marker <- plotScater(sce, block1="Marker",
+              colour_by="Marker", nfeatures=500, exprs_values="counts")
+
+plot_grid(cov.plate, cov.type, cov.marker,
+          labels=c("Coverage by plate", "Coverage by well type", "Coverage by GFP"),
+          nrow=3)
+```
+
+
+The top plot shows the coverage across cells between different plates, with no obvious differences between them.  Plate 8 looks like it might have poorer coverage across the transcriptome in more cells than the other plates.  I wonder if this is related to the differences in insert sizes for these libraries?  The middle plot shows the different wells, i.e. emptpy, multi-cell and single cell.  The multi- and single cells look like they generally have good coverage.  I'm a little concerned by the presence of material in what looks like at least 4 of the empty wells.  This might indicate cross-contamination between wells, or that cells were accidentally sorted into these wells.  Finally there is no difference between the GFP+/- cells, again a useful check and gives us confidence in the quality of these data.
+
+For the empty wells, I want to check that they are dominated by just a few transcripts.  I'll plot the proportion of variance in the data due to the top 50 genes between empy and single-cell wells.
+
+```{r, fig.height=4.5, fig.width=6.5, echo=FALSE}
+qc.empty <- plotQC(sce[sce$SampleType == "Empty"],
+                   type="highest-expression")
+qc.single <- plotQC(sce[sce$SampleType == "Single-cell"],
+                   type="highest-expression")
+
+plot_grid(qc.empty, qc.single,
+          ncol=2)
+```
+
+
+The empty wells are dominated by expression of Eukaryotic translation elongation factor 1 alpha 1 (ENSMUSG00000037742); I've seen this before in other single cell datasets where there is little to no biologically meaningful material, so that's a relief!  The other sanity check is that these empty wells are also heavily dominated by the spike in transcripts (ERCC-), which often is the case where there are little to no endogenous transcripts present.  Let's check that the empty wells that have lots of sequencing reads are almost entirely dominated by the spike in genes.
+
+
+```{r, echo=FALSE, warnings=FALSE, message=FALSE, fig.height=4.5, fig.width=4.5}
+plotQC(sce[, sce$SampleType == "Empty"], type="explanatory-variables")
+```
+
+
+This plot shows how much variation in each of the empty wells is explained by different factors.  It looks like all of the variance can be explained by the presence of `n_detected_feature_controls_Spikes`, which are the spike-ins!  So all of the sequencing reads we see in the empty wells are just the spike in transcripts, phew.  This highlights the importance of looking at the data from many angles to understand what are the important features in a single cell experiment.
+
+Now, let's look at a few more aspects of the proper single cells, like the spike in transcripts, and factors that explain the variability in the data.  Then we can start to draw up some filtering thresholds to remove poor quality cells.
+
+
+```{r, echo=FALSE, fig.height=4.5, fig.width=9.5, warnings=FALSE, message=FALSE}
+p.all <- plotQC(sce, type="exprs-freq-vs-mean")
+p.spike <- plotQC(sce, type="exprs-freq-vs-mean", feature_set=fData(sce)$is_feature_control_Spikes)
+
+plot_grid(p.all, p.spike,
+          ncol=2)
+```
+
+This plots how frequently expressed a gene is vs. it's average expression across all cells.  The orange triangles are the spike in transcripts which we'll use for normalisation and estimating techinical sources of variation later.  The take home messages are that there a good number of spike in transcripts expressed across most of the cells, which is good for getting a better estimate of technical noise and account for any differences in RNA content between cells of different sizes.  It's a bit easier to see this in the right hand plot which shows just the spike in transcripts.  There are also quite a lot of genes expressed across > 50% of cells, which means we'll have lots of information to use for clustering and other analyses.  Overall, I would say this underlines the quality of these data.
+
+### Detect outlier and determine QC thresholds
+
+The first thing we can do is look at the variability in the single cells (I'll ignore the empty wells and multi-cell control for this part), and see what other features might explain it.  In particular it will be useful to identify possible outliers that represent poor quality cells (please excuse this long list of cell IDs, I can't figure how to turn off this output).
+
+```{r, echo=FALSE, warnings=FALSE, message=FALSE, fig.height=4.5, fig.width=4.5}
+sce <- plotPCA(sce, pca_data_input="pdata",
+               detect_outliers=TRUE, return_SCESet=TRUE,
+               draw_plot=TRUE)
+```
+
+We can see that a long stream of cells is characterised as outliers along the x-axis.  This axis explains the largest amount of variation in the data, so it is not suprising that this separates poor quality cells from good ones.  We can look at what the features are that best explain this variation, and use these to guide our QC filtering.
+
+The strongest components are the % of expression that comes from the top 100 genes; those libraries dominated by just a few genes, unsurprisingly.  The other factors relate to the amount of the library real estate attributed to the spike in transcripts, again an indicator of poor quality cells.  This analysis calls 192 cells outliers, but I want to make sure that I'm only removing the poor quality cells, and that this is not due to the biology of these cells.
+
+#### QC thresholds
+
+Filtering thresholds:
+
+* library attributed to rRNA genes > 30%
+* library attributed to ERCC spike in transcripts > 20%
+* total library size < 100K
+* number of genes detected < 2000
+
+Below are some plots of the single cells which shows these filtering thresholds.  In several cases it looks like these form a mid point between two groups of cells.
+
+```{r, fig.height=7.5, fig.width=7.5, echo=FALSE, warnings=FALSE, message=FALSE}
+qc.rrna <- ggplot(as.data.frame(colData(sce)),
+                  aes(rRNA.rate, fill=Plate)) +
+  geom_density(alpha=0.3) + theme_mike() +
+  scale_fill_Publication() +
+  geom_vline(aes(xintercept=0.3), linetype=3, colour="purple") +
+  labs(x="% rRNA", y="Density")
+
+
+qc.spikes <- ggplot(as.data.frame(colData(sce)),
+                  aes(pct_counts_Spikes, fill=Plate)) +
+  geom_density(alpha=0.3) + theme_mike() +
+  scale_fill_Publication() +
+  geom_vline(aes(xintercept=20), linetype=3, colour="purple") +
+  labs(x="% ERCC Spike in", y="Density")
+
+
+qc.size <- ggplot(as.data.frame(colData(sce)),
+                  aes(log10_total_counts, fill=Plate)) +
+  geom_density(alpha=0.3) + theme_mike() +
+  scale_fill_Publication() +
+  geom_vline(aes(xintercept=5), linetype=3, colour="purple") +
+  labs(x=expression(paste("Log"[10]," library size")), y="Density")
+
+
+qc.genes <- ggplot(as.data.frame(colData(sce)),
+                  aes(total_features, fill=Plate)) +
+  geom_density(alpha=0.3) + theme_mike() +
+  scale_fill_Publication() +
+  geom_vline(aes(xintercept=2000), linetype=3, colour="purple") +
+  labs(x="Genes detected", y="Density")
+
+plot_grid(qc.rrna, qc.spikes, qc.size, qc.genes,
+          labels=c("rRNA", "Spike in expression", "Library size", "Genes detected"),
+          ncol=2)
+
+```
+
+It looks like plate 8 is more adversely affected by poor quality cells than the others based on the library sizes and number of genes detected.
+
+```{r, echo=FALSE, warnings=FALSE, message=FALSE}
+my.outlier <- numeric(length=dim(adipose)[2])
+my.outlier[sce$rRNA.rate > 0.3] <- 1
+my.outlier[sce$pct_counts_Spikes > 20] <- 1
+my.outlier[sce$log10_total_counts < 5] <- 1
+my.outlier[sce$total_features < 2000] <- 1
+
+sce$my_outlier <- my.outlier
+
+knitr::kable(table(unlist(sce$my_outlier), sce$outlier))
+```
+
+Both methods for identifying poor quality cells agree on 181 cells that need to be removed.  The threshold based approach identifies _more_ cells than the outlier (222 vs. 192).  I'm inclined to be more conservative and go with the cells that are removed using the filtering thresholds.  Finally I want to see just how unbalanced this filtering is across plates.
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.height=4.5, fig.width=4.5}
+ggplot(as.data.frame(colData(sce)), aes(x=my_outlier, fill=Plate)) +
+  geom_bar() + theme_mike() +
+  scale_fill_Publication() +
+  labs(x="QC fail", y="Count")
+
+```
+
+So, that's it for the QC.  There are a few more cells rejected on plate 8 than the others, so I'll keep an eye on this plate in all of the other analyses.  In total we've got 930 cells to take into downstream analyses.
+
+```{r, echo=FALSE}
+count.df <- as.data.frame(counts(sce[, sce$my_outlier == 0]))
+count.df$gene_id <- genes
+
+write.table(count.df,
+            "~/Dropbox/Adipose/Adipose-counts.tsv",
+            quote=F, sep="\t")
+
+write.table(as.data.frame(colData(sce[, sce$my_outlier == 0])),
+            "~/Dropbox/Adipose/Adipose-metadata.tsv",
+            quote=F, sep="\t")
+
+write.table(sce[, sce$my_outlier == 1]$Sample,
+            "~/Dropbox/Adipose/Adipose_qc-out.tsv",
+            quote=F, sep="\t", row.names=F)
+```
+

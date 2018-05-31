@@ -1,0 +1,2807 @@
+---
+title: 'Adipose Precursors: Part 5 - Pseudotime ordering of biological processes'
+author: "Mike Morgan"
+output: html_notebook
+---
+## Determining order of induction during adipogenesis
+
+One of the bonus features of having a pseudotemporal ordering is that you can treat it like time series.  This also means that if you know which way the arrow of developmental/activation/differentiation time points, then you should be able to infer the ordering of events along that time line.  Specifically, I want to be able to pinpoint, or rather order, the onset of specific biological processes during adipogenesis.
+
+Currently the clustering groups together genes with similar profiles, but there is inevitably some offset there.  I wish to be able to identify the initiating events, assuming they are captured in these data and have not happened further upstream, during adipogenesis.  For instance, does the onset of MET precede the response to complement, or _vice versa_ (or are they effectively simultaneous signals)?
+
+My proposed approach to this is as follows:
+
+* calculate the cross-correlation, $\tau$, for each pair of genes $i,j$ in $i \in \{1,2,..., M\}, j \in \{1,2,...,N\}$
+* find the lag $l_g$ at which $max |\tau|$
+* if $l_g$ is positive and non-zero then gene $i$ comes after gene $j$, if it is negative the gene $i$ comes before gene $j$.  If $l_g = 0$, then they are changing simultaneously
+
+I will use the smoothed window data for each gene, and compare the GAM fit and average expression.  I think using the raw expression with the individuals ordered cells will be too noisy, and does not allow for uncertainty in the cell ordering.
+
+This will give me the information about the activation and repression of each gene relative to each other gene, but it does not necessarily tell me which processes are coming on _per se_.  If I want to look at more general biological processes, then I will need to summarise over all genes in that process.  Depending on how I do that, it may make assumptions about how those particular genes behave.  For instance, if I average across genes, then this will mask differences in dynamics _within_ a cluster.  I could take the eigenvector through all genes over time in some process and cluster, which would capture any variability, but might be heavily skewed by just one or a few genes.  What other way might there be to capture changes in expression dynamics of an entire biological process?  I'll have to think about that.  Maybe calculate the cross-correlations only between genes within the same cluster/biological process to find which ones are the earliest events, then take all of the early genes for all processes, and compare them to each other?  That would certainly reduced the computational requirements.  I'll try that first.
+
+I will need to break the data into the three branches; left, right and central for this to be valid.
+
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+suppressPackageStartupMessages(library(org.Mm.eg.db))
+suppressPackageStartupMessages(library(reshape2))
+suppressPackageStartupMessages(library(lsa))
+suppressPackageStartupMessages(library(biomaRt))
+suppressPackageStartupMessages(library(flashClust))
+suppressPackageStartupMessages(library(destiny))
+suppressPackageStartupMessages(library(ggrepel))
+suppressPackageStartupMessages(library(pheatmap))
+suppressPackageStartupMessages(library(cowplot))
+suppressPackageStartupMessages(library(GGally))
+suppressPackageStartupMessages(library(goseq))
+suppressPackageStartupMessages(library(statmod))
+suppressPackageStartupMessages(library(limma))
+suppressPackageStartupMessages(library(RColorBrewer))
+suppressPackageStartupMessages(library(mgcv))
+suppressPackageStartupMessages(library(WGCNA))
+suppressPackageStartupMessages(library(stringr))
+suppressPackageStartupMessages(library(scales))
+suppressPackageStartupMessages(library(GO.db))
+library(lettercase)
+library(VennDiagram)
+library(grid)
+source("~/Dropbox/R_sessions/GGMike/theme_mike.R")
+source("~/Dropbox/R_sessions/Clustering/CosineKNN.R")
+source("~/Dropbox/R_sessions/SingleCellFunctions/single_cell_functions.R")
+
+# load in all data and meta data
+adipose.nz <- read.table("~/Dropbox/Adipose/Adipose-SF_norm.tsv",
+                         sep="\t", h=T, stringsAsFactors=F)
+rownames(adipose.nz) <- adipose.nz$gene_id
+adipose.nz <- adipose.nz[, -ncol(adipose.nz)]
+
+meta.merge <- read.table("~/Dropbox/Adipose/Adipose-Meta_partition.tsv",
+                         sep="\t", h=T, stringsAsFactors=F)
+meta.merge$Cluster <- as.factor(meta.merge$Cluster)
+
+HVG <- read.table("~/Dropbox/Adipose/Adipose-HVG.tsv",
+                  sep="\t", h=T, stringsAsFactors=F)
+
+adipose.hvg <- adipose.nz[HVG$HVG, ]
+adipose.hvg[is.na(adipose.hvg)] <- 0
+
+adipose.pca <- prcomp(t(adipose.hvg), scale=T, center=T)
+var.exp <- adipose.pca$sdev**2/sum(adipose.pca$sdev**2)
+sum.var <- 0
+n.comps <- 0
+for(x in 1:length(var.exp)){
+  while(sum.var < 0.75){
+    sum.var <- sum.var + var.exp[x]
+    n.comps <- n.comps + 1
+  }
+}
+
+adipose.pcs <- as.data.frame(t(adipose.pca$x[, 1:n.comps]))
+
+ensembl <- useEnsembl(biomart='ensembl', dataset='mmusculus_gene_ensembl', GRCh=37)
+
+gene_symbol <- getBM(attributes=c('ensembl_gene_id', 'external_gene_name'),
+                     filters='ensembl_gene_id', mart=ensembl,
+                     values=rownames(adipose.nz))
+rownames(gene_symbol) <- gene_symbol$ensembl_gene_id
+
+adipose.nz$gene_id <- rownames(adipose.nz)
+adipose.merge <- merge(adipose.nz, gene_symbol, by.x="gene_id", by.y="ensembl_gene_id", all.x=TRUE)
+adipose.merge$external_gene_name[adipose.merge$gene_id == "eGFP"] <- "GFP"
+
+adipose.nz <- adipose.nz[, -dim(adipose.nz)[2]]
+
+dc.merge <- read.table("~/Dropbox/Adipose/Adipose-Meta_partition.tsv",
+                       sep="\t", h=T, stringsAsFactors=F)
+dc.merge$Cluster <- as.factor(dc.merge$Cluster)
+# add cluster interpretation labels
+# 1 & 3 = most mature, 2 = most naive, 4 = intermediate
+dc.merge$ClusterLabel <- ""
+dc.merge$ClusterLabel[dc.merge$Cluster %in% c(2, 3)] <- "Mature"
+dc.merge$ClusterLabel[dc.merge$Cluster %in% c(1)] <- "Naive"
+dc.merge$ClusterLabel[dc.merge$Cluster %in% c(4)] <- "Intermediate"
+dc.merge$ClusterLabel <- factor(dc.merge$ClusterLabel,
+                                  levels=c("Naive", "Intermediate", "Mature"),
+                                  labels=c("Naive", "Intermediate", "Mature"))
+
+# label.map <- col2hcl(unique(dc.merge$Cluster))
+# names(label.map) <- c("Mature", "Mature", "Naive", "Intermediate")
+label.map <- c("#FF7800", "#FFB200", "#AB611E")
+names(label.map) <- c("Naive", "Intermediate", "Mature")
+
+col.map <- col2hcl(levels(dc.merge$Cluster))
+names(col.map) <- levels(dc.merge$Cluster)
+
+part1.de.genes <- read.table("~/Dropbox/Adipose/Adipose-DEgenes_Allptime.tsv",
+                            h=TRUE, sep="\t", stringsAsFactors=FALSE)
+
+# part1.right.de.genes <- read.table("~/Dropbox/Adipose/Adipose-DEgenes_Rightptime.tsv",
+#                             h=TRUE, sep="\t", stringsAsFactors=FALSE)
+
+part2.de.genes <- read.table("~/Dropbox/Adipose/Adipose-DEgenes_Leftptime-Kmeans2.tsv",
+                            h=TRUE, sep="\t", stringsAsFactors=FALSE)
+
+all.de.genes <- unique(c(part1.de.genes$gene_id[part1.de.genes$Sig == 1],
+                         #part1.right.de.genes$gene_id[part1.right.de.genes$Sig == 1],
+                         part2.de.genes$gene_id[part2.de.genes$Sig == 1]))
+```
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+# read in the hallmarks and map the human gene IDs onto mouse homologs
+# pull in the c4 and c6 gene sets
+source("~/Dropbox/R_sessions/src/generic_functions.R")
+hallmark.geneset <- read.table("~/Dropbox/Genesets/hallmark.c2_ensemblgeneIds.txt",
+                         sep="\t", stringsAsFactors=FALSE, h=T)
+
+ortho.gene_symbol <- getBM(attributes=c('ensembl_gene_id', 'external_gene_name', 'hsapiens_homolog_orthology_type',
+                                  'hsapiens_homolog_ensembl_gene'),
+                     filters='ensembl_gene_id', mart=ensembl,
+                     values=rownames(adipose.nz))
+# remove many 2 one orthologs and many2many that are duplicated
+
+# map the human gene IDs to the mouse ones
+hallmark.merge <- merge(hallmark.geneset, ortho.gene_symbol, by.x='ensembl_gene_id', by.y='hsapiens_homolog_ensembl_gene')
+colnames(hallmark.merge) <- c("hsapiens_ensembl", "GeneSet", "ensembl_gene_id", "external_gene_name", "hsapiens_orthology_type")
+
+# this might take a while!
+hallmark.go <- map2go(hallmark.merge)
+```
+
+
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+# read in the functional enrichments for each cluster of DE genes, for each pseudotime-dependent component/branch analysis
+# left branch
+part1.files <- list.files("~/Dropbox/Adipose/", pattern="Kmeans1-Pseudotime_GO")
+part1.files <- part1.files[!grepl(part1.files, pattern="Kmeans2")]
+part1.left.go.enrich <- list()
+
+for(i in seq_along(part1.files)){
+  fle <- paste0("~/Dropbox/Adipose/", part1.files[i])
+  tab.fle <- read.table(fle, sep="\t", h=TRUE, stringsAsFactors=FALSE)
+  cluster <- gsub(unlist(lapply(strsplit(part1.files[i], split="-", fixed=T),
+                                FUN=function(X) paste0(X[4]))),
+                  pattern="Cluster.tsv", replacement="")
+  if(dim(tab.fle)[1] > 0){
+    tab.fle$Cluster <- cluster
+    part1.left.go.enrich[[cluster]] <- tab.fle
+  }
+}
+
+part1.left.go.df <- do.call(rbind.data.frame,
+                            part1.left.go.enrich)
+
+# # right branch
+# right.files <- list.files("~/Dropbox/Adipose/", pattern="RightPseudotime_GO")
+# part1.right.go.enrich <- list()
+# 
+# for(i in seq_along(right.files)){
+#   fle <- paste0("~/Dropbox/Adipose/", right.files[i])
+#   tab.fle <- read.table(fle, sep="\t", h=TRUE, stringsAsFactors=FALSE)
+#   cluster <- gsub(unlist(lapply(strsplit(right.files[i], split="-", fixed=T),
+#                                 FUN=function(X) paste0(X[3]))),
+#                   pattern="Cluster.tsv", replacement="")
+#   if(dim(tab.fle)[1] > 0){
+#     tab.fle$Cluster <- cluster
+#     part1.right.go.enrich[[cluster]] <- tab.fle
+#   }
+# }
+# 
+# part1.right.go.df <- do.call(rbind.data.frame,
+#                              part1.right.go.enrich)
+
+# central branch
+left.files <- list.files("~/Dropbox/Adipose/", pattern="LeftPseudotime_GO")
+part2.left.files <- left.files[grepl(left.files, pattern="Kmeans2")]
+part2.left.go.enrich <- list()
+
+for(i in seq_along(part2.left.files)){
+  fle <- paste0("~/Dropbox/Adipose/", part2.left.files[i])
+  tab.fle <- read.table(fle, sep="\t", h=TRUE, stringsAsFactors=FALSE)
+  cluster <- gsub(unlist(lapply(strsplit(part2.left.files[i], split="-", fixed=T),
+                                FUN=function(X) paste0(X[3]))),
+                  pattern="Cluster", replacement="")
+  if(dim(tab.fle)[1] > 0){
+    tab.fle$Cluster <- cluster
+    part2.left.go.enrich[[cluster]] <- tab.fle
+  }
+}
+
+part2.left.go.df <- do.call(rbind.data.frame,
+                            part2.left.go.enrich)
+```
+
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+# break in to left, right and central branches of cells.
+# order them by DPT value
+part1.branch.cells <- dc.merge$Sample[dc.merge$Kmeans == 1]
+part1.branch.cells <- part1.branch.cells[order(dc.merge$DPT1[dc.merge$Kmeans == 1])]
+
+# part1.right.branch.cells <- dc.merge$Sample[(dc.merge$Cluster %in% c(2, 3)) & (dc.merge$Kmeans == 1)]
+# part1.right.branch.cells <- part1.right.branch.cells[order(dc.merge$DPT1[(dc.merge$Cluster %in% c(2, 3)) & (dc.merge$Kmeans == 1)])]
+
+part2.left.branch.cells <- dc.merge$Sample[(dc.merge$Kmeans == 2)]
+part2.left.branch.cells <- part2.left.branch.cells[order(dc.merge$DPT1[(dc.merge$Kmeans == 2)])]
+```
+
+I'll do this just for the right-branch cells as a test to see if it works.
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+# only select the DE genes from the relevant branch pseudotime-dependent analysis
+# order cells by pseudotime value
+part1.right.rates <- adipose.nz[part1.de.genes$gene_id[part1.de.genes$Sig == 1],
+                                intersect(part1.branch.cells, colnames(adipose.nz))]
+part1.right.rates <- part1.right.rates[, part1.branch.cells]
+```
+
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+# read in the clustering information already performed on the right-branch DE genes
+part1.right.branch.clusters <- read.table("~/Dropbox/Adipose/Adipose_Kmeans1-Pseudotime_DEgenes-clusters.tsv",
+                                          sep="\t", h=TRUE, stringsAsFactors=FALSE)
+```
+
+Maybe this is over-clustered a little, but it looks pretty good.  I will use this clustering to find early initiating events _within_ each cluster first, then compare the different early genes _across_ clusters.
+
+```{r, echo=FALSE}
+# loop over genes within a cluster and calculte the ccf on each pair. start with the blue cluster of genes
+turq.genes <- part1.right.branch.clusters$gene_id[part1.right.branch.clusters$Cluster == "blue"]
+n.windows <- floor(dim(part1.right.rates)[2]/2) - 1
+# store the lag at which thw absolute value is highest.
+ccf.list <- list()
+for(i in seq_along(turq.genes)){
+  i.list <- list()
+  for(j in seq_along(turq.genes)){
+    xcor <- ccf(x=as.numeric(part1.right.rates[turq.genes[i], ]),
+                y=as.numeric(part1.right.rates[turq.genes[j], ]),
+                plot=FALSE,
+                lag.max=n.windows)
+    i.list[[turq.genes[j]]] <- xcor
+  }
+  ccf.list[[turq.genes[i]]] <- i.list
+}
+```
+
+The `ccf.list` contains all of the `acf` class objects for each pair of genes in the `blue` cluster.  I will need the lag at which the absolute value is maximal for each pair.
+
+```{r}
+lag.list <- list()
+for(i in 1:length(turq.genes)){
+  i.lags <- list()
+  for(j in 1:length(turq.genes)){
+    ccf.obj <- ccf.list[[turq.genes[i]]][[turq.genes[j]]]
+    lag <- ccf.obj$lag
+    max.cor <- max(abs(ccf.obj$acf))
+    max.idx <- which(abs(ccf.obj$acf) == max.cor)
+    max.lag <- lag[max.idx]
+    i.lags[[turq.genes[j]]] <- max.lag
+  }
+  lag.list[[turq.genes[i]]] <- i.lags
+}
+
+lag.df <- data.frame(lapply(lag.list, unlist))
+```
+
+Let's take a look at the pairwise lags between genes as heatmap.  Negative values will show genes that come before others, and positive where they come after.  The genes with the greatest number of negative lags should indicate the earliest events.
+
+```{r}
+pheatmap(lag.df,
+         cluster_rows=TRUE, cluster_cols=TRUE,
+         show_rownames=FALSE, show_colnames=FALSE)
+```
+
+OK, the first problem is that depending on which side of the diagonal we look at, blocks of genes either come before or after.  Most genes are changing (or not) simultaneously, i.e. lag=0.  What I really want to do is combine this information with the pseudotime GAM fit to determine exactly which gene precedes which.
+
+We want a measure to rank the genes, where the highest ranking genes are the earliest.  I propose to count the number of + signs along the columns and row, and use the ratio of these two values as a ranking score.  Values with 0 in the numerator indicate there are no + values, only 0 and - values suggesting these are the earliest expression changes.  More formally:
+
+$$R_g^+ = \frac{\Sigma \tau(i,j)_{l+}}{\Sigma \tau(j, i)_{l+}}  $$
+
+Where:
+
+$$ \tau(i, j)_{l+} = lagmax |\tau(i, j)|$$
+$$\tau(j, i)_{l+} = lagmax |\tau(j, i)|$$
+
+This represents the ratio of positive cross-correlation lags when gene $i$ is the reference, compared to when gene $j$ is the reference.  The justification is that genes that are more often early events will have many fewer positive lag values.  If a gene has a balance this value will lie ~1 and large values will indicate the genes that change the latest along the temporal domain.  It may also be necessary to check the robustness of the sign by defining a null distribution from shuffled timepoints on genes that are flat, i.e. not DE (thanks Aaron).  Genes whose lag values fall within the 99% confidence interval of this null distribution will be set to 0.  This should clean up the rankings, but might also generate more ties.
+
+There's a problem with defining the null distribution, but I can't figure out quite what it is now.  I'll comeback to this specific problem, I don't think it is crucial.
+
+An alternative way to rank genes would be to count the proportion of -ve signs compared to the total.  Genes with many -ve signs will rank at the top with higher values.
+
+```{r, warning=FALSE, echo=FALSE, message=FALSE, fig.height=5.5, fig.width=7.5}
+row.pos <- rowSums(lag.df > 0)
+row.neg <- rowSums(lag.df < 0)
+
+R.neg <- row.neg/dim(lag.df)[1]
+# R.pos <- row.pos/col.pos
+
+# Inf values occur when the denominator of R.neg == 0
+# look at the expression of the top 5 Inf genes
+
+inf.genes <- head(names(R.neg)[order(R.neg, decreasing=TRUE)], 10)
+
+inf.av <- part1.right.rates[inf.genes, ]
+inf.av$gene_id <- inf.genes
+inf.av.melt <- melt(inf.av, id.vars="gene_id")
+colnames(inf.av.melt) <- c("gene_id", "Sample", "Mean")
+# merge with actual DPT values
+inf.av.melt <- merge(inf.av.melt, dc.merge[, c("Sample", "DPT1", "Marker", "ClusterLabel")],
+                     by='Sample')
+#inf.av.melt$Window <- as.numeric(gsub(inf.av.melt$Window, pattern="X", replacement=""))
+
+inf.all <- Reduce(f=function(x, y) merge(x, y, by=c("gene_id", "Window")),
+                    x=list("Mean"=inf.av.melt))
+
+inf.merge <- merge(inf.all, gene_symbol, by.x='gene_id', by.y='ensembl_gene_id')
+#colnames(inf.merge) <- c("gene_id", "Window", "Mean", "symbol")
+
+ggplot(inf.merge, aes(x=DPT1, y=Mean, colour=external_gene_name)) +
+  geom_point(alpha=0.5) + 
+  theme_mike() +
+  #geom_errorbar(mapping=aes(ymin=Mean-SD, ymax=Mean+SD, colour=symbol), alpha=0.5) +
+  #geom_line(aes(x=Window, y=Fit), size=1) +
+  scale_colour_Publication() +
+  facet_wrap(~ external_gene_name, ncol=4)
+```
+
+This works in principal.  Ranking genes within each cluster just gives the ordering of genes _within_ that cluster, but doesn't provide any information about which biological processes are coming on at what points necessarily.  I will use the 'eigengene' kind of approach and take the eigenvector through the GAM fit of the genes in each cluster.  Using these cluster eigengenes I will then do the same cross-correlation analysis to find the clusters that precede others.
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+find_eigengene <- function(dataframe, side="left"){
+  # calculate the eigenvector through the set of genes
+  # assume windows are columns and genes are rows
+  # assume the first eigenvector as the eigengene
+  spec <- svd(dataframe)
+  if(side == "left"){
+    eigengene <- abs(spec$v[, 1])
+  } else if(side == "right"){
+    eigengene <- abs(spec$u[, 1])
+  }
+  return(eigengene)
+}
+```
+
+This is a test case for the `turquoise` cluster.  We can see the pattern of expression is still quite lumpy, which suggests the first eigenvector is capturing that variation at each time point.  There is also a clear change over time, which suggests that it is also capturing the temporal variation through the cluster.
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.height=3, fig.width=4.5}
+turq.eigen <- cbind.data.frame(find_eigengene(part1.right.rates[turq.genes, ]))
+rownames(dc.merge) <- dc.merge$Sample
+turq.eigen$Window <- dc.merge[part1.branch.cells, ]$DPT1
+colnames(turq.eigen) <- c("Eigengene", "Window")
+
+ggplot(turq.eigen, aes(x=Window, y=Eigengene)) +
+  geom_point() + theme_mike() +
+  geom_line()
+```
+
+OK, let's try this for all of the clusters.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+unique.clusters <- unique(as.character(part1.right.branch.clusters$Cluster))
+
+eigengenes <- list()
+for(x in 1:length(unique.clusters)){
+  cluster <- unique.clusters[x]
+  cluster.genes <- part1.right.branch.clusters$gene_id[part1.right.branch.clusters$Cluster== cluster]
+  cluster.fit <- part1.right.rates[cluster.genes, ]
+  cluster.eigengene <- find_eigengene(cluster.fit)
+  eigengenes[[cluster]] <- cluster.eigengene
+}
+
+eigen.df <- data.frame(do.call(cbind, eigengenes))
+colnames(eigen.df) <- unique.clusters
+eigen.df$DPT <- dc.merge[part1.branch.cells, ]$DPT1
+
+eigen.melt <- melt(eigen.df, id.vars="DPT")
+colnames(eigen.melt) <- c("DPT", "Cat", "Eigenvector")
+
+eigen.map <- col2hcl(unique.clusters)
+names(eigen.map) <- unique.clusters
+
+ggplot(eigen.melt, aes(x=DPT, y=Eigenvector, colour=Cat)) +
+  geom_point(size=1, alpha=0.6) + 
+  stat_smooth(span=0.25) +
+  theme_mike() + scale_colour_manual(values=eigen.map)
+```
+
+Well, it seems that the clusters of DE genes along the diffusion pseudotime basically results in different shapes at the end/beginning of the pseudotime ordering; the rest is all very similar.  I'm not sure how much of that is just down to the span used in the loess curves.  Let's take a look at the cross-correlation functions, as there might be some subtle timing shifts.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+eigen.ccf <- list()
+for(i in 1:length(unique.clusters)){
+  eigen.i <- list()
+  for(j in 1:length(unique.clusters)){
+    x <- eigen.df[, unique.clusters[i]]
+    y <- eigen.df[, unique.clusters[j]]
+    eigen.xcor <- ccf(x=x,
+                      y=y,
+                      plot=FALSE, lag.max=5)
+    lag <- eigen.xcor$lag
+    eigen.cor <- max(abs(eigen.xcor$acf))
+    eigen.idx <- which(abs(eigen.xcor$acf) == eigen.cor)
+    eigen.lag <- lag[eigen.idx]
+    eigen.i[[unique.clusters[j]]] <- eigen.lag
+  }
+  eigen.ccf[[unique.clusters[i]]] <- eigen.i
+}
+
+eigen.ccf.df <- data.frame(lapply(eigen.ccf, unlist))
+hmcol <- colorRampPalette(brewer.pal(9, "RdYlBu"))(100)
+
+pheatmap(eigen.ccf.df + rnorm(4, mean=0.00001, sd=0.00001),
+         color=hmcol)
+```
+
+OK, so this is working in principal now.  None of these eigengenes are lagged w.r.t. to the right branch of cells in partition 1.
+
+It might be possible to get a bit more resolution about specific biological process timing by taking the same approach, and applying it to the genes within each enriched functional term.  Qualitatively it may yield exactly the same result.
+
+### Ordering enriched functional terms
+
+I will start with the the enriched terms in the green cluster of genes.  These relate to cell adhesion, morphogenesis and cell migration.  I stronly suspect there is a lot of genes that overlap in these terms.  I will initially treat them as independent, then think of a way to merge or account for the large overlaps.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+GO.sig.all <- part1.left.go.df[part1.left.go.df$Cluster == "blue", ]
+```
+
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+GO.all <- GO.sig.all[order(GO.sig.all$padjust, decreasing=FALSE), ][1:20, ]
+top.cats <- GO.all
+top.cats <- top.cats[order(top.cats$foldEnrich, decreasing=TRUE), ]
+
+# retrieve all GO categories for the cluster genes
+# returns a list of genes and their GO categories
+brown.genes <- part1.right.branch.clusters$gene_id[part1.right.branch.clusters$Cluster == "blue"]
+brown.go  <- hallmark.go[intersect(brown.genes, names(hallmark.go))]
+#brown.go <- getgo(genes=brown.genes, genome="mm10", id="ensGene", fetch.cats="GO:BP")
+
+go2gene <- list()
+# for each category, pull out the respective genes
+# get the expression for those genes
+# calculate the eigengene over the pseudotime-ordered expresison for those genes
+for(g in 1:length(brown.genes)){
+  gene <- brown.genes[g]
+  match.cats <- intersect(brown.go[[gene]], GO.all$category)
+  if(length(match.cats) > 0){
+    for(c in 1:length(match.cats)){
+      go2gene[[match.cats[c]]] <- c(go2gene[[match.cats[c]]], gene)
+    }
+  }
+}
+
+cat.hits <- names(go2gene)
+go2eigen <- list()
+for(i in 1:length(cat.hits)){
+  go.genes <- go2gene[[cat.hits[i]]]
+  go.fit <- part1.right.rates[go.genes, ]
+  go.eigen <- find_eigengene(go.fit)
+  go2eigen[[cat.hits[i]]] <- go.eigen
+}
+
+go.eigen.df <- data.frame(do.call(cbind, go2eigen))
+colnames(go.eigen.df) <- cat.hits
+go.eigen.df$DPT <- dc.merge[part1.branch.cells, ]$DPT1
+
+go.eigen.melt <- melt(go.eigen.df, id.vars="DPT")
+colnames(go.eigen.melt) <- c("DPT", "Cat", "Eigengene")
+```
+
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.width=9.75, fig.height=3.75}
+ggplot(go.eigen.melt, aes(x=DPT, y=Eigengene, colour=Cat)) +
+  geom_point(alpha=0.6, size=1) + 
+  stat_smooth(span=0.2) +
+  scale_colour_Publication() +
+  theme(legend.text = element_text(size=7, angle=0))
+```
+
+OK, so this also works, and shows that _all_ of the top 20 enriched categories are following roughly the same expression trajectory over pseudotime.  Now, it would really be better to find the set of independent GO terms if possible. REVIGO is useful for this purpose, but usually gives the top-level term, which are often quite uniformative.  It is also not possible to automate, as it is a web server withouth an API/programmatic access.  Maybe just suck it up and or find the category that contains the largest?
+
+It is possible to calculate the degree of shared genes between each pair of categories, given the input gene set.  Is this analagous to finding a set of approximately unrelated individuals given their IBD?  Let's calculate and Identity By Gene (IBG) for each pair of enriched categories in the `red` cluster.
+
+$$IBG(A, B) = \frac{\#A \cap B}{\#A \cup B}$$
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+category_igb <- function(go.map, categories){
+  cat.igb <- list()
+  for(i in 1:length(categories)){
+    i.igb <- list()
+    for(j in 1:length(categories)){
+      num.igb <- length(intersect(go.map[[categories[i]]],
+                                  go.map[[categories[j]]]))
+      denom.igb <- length(union(go.map[[categories[i]]],
+                                go.map[[categories[j]]]))
+      igb <- num.igb/denom.igb
+      i.igb[[categories[j]]] <- igb
+    }
+    cat.igb[[categories[i]]] <- i.igb
+  }
+  
+  igb.df <- data.frame(lapply(cat.igb, unlist))
+  return(igb.df)  
+}
+
+igb.df <- category_igb(go2gene, cat.hits)
+
+pheatmap(igb.df,
+         clustering_method="complete",
+         fontsize=7, show_rownames = FALSE, show_colnames=FALSE,
+         filename="~/Dropbox/Reports_Adipose/Adipogenesis2017/Figures/GO_IGB_heatmap.png",
+         height=5.75, width=5.75, res=300)
+```
+
+This shows the degree of overlapping genes between categories, we can see that some categories contain almost entirely the same set of genes.  These are the categories we wish to merge together.  I would say that a hard threshold of 0.6 would result in 11 approximately independent GO categories in this cluster.  Is there a clustering algorithm that would find these nicely, with many clusters of 1 category, something density based maybe?
+
+Collapse together all GO categories with IGB $\geq$ 0.6, then recalculate the eigengene from the collapsed set of categories.
+
+
+```{r}
+category_eigengene <- function(cat_groups, cat_clusters, go.map, dataframe, cluster_name,
+                               pseudotime){
+  cat2eigen <- list()
+  genes.list <- list()
+  for(i in seq_along(cat_groups)){
+    clust <- cat_groups[i]
+    cats <- names(cat_clusters)[cat_clusters == clust]
+    cat.genes <- unique(unlist(go.map[cats]))
+    cat.fit <- dataframe[cat.genes, ]
+    cat.eigen <- find_eigengene(cat.fit)
+    cat2eigen[[cat_groups[i]]] <- cat.eigen
+    genes.list[[cat_groups[i]]] <- cat.genes
+  }
+  cat.eigen.df <- data.frame(do.call(cbind, cat2eigen))
+  colnames(cat.eigen.df) <- cat_groups
+  cat.eigen.df$DPT <- pseudotime
+  
+  cat.eigen.melt <- melt(cat.eigen.df, id.vars="DPT")
+  colnames(cat.eigen.melt) <- c("DPT", "Cat", "Eigengene")
+  cat.eigen.melt$Cat <- paste(cluster_name, cat.eigen.melt$Cat, sep=".")
+  
+  eigen.obj <- list("melt"=cat.eigen.melt,
+                    "genes"=genes.list)
+  return(eigen.obj)
+}
+
+cats.clust <- flashClust(as.dist(igb.df), method="complete")
+collapse.cats <- cutree(cats.clust, h=0.6)
+cat.groups <- unique(collapse.cats)
+
+cat.eigen.obj <- category_eigengene(cat.groups, collapse.cats, go2gene, part1.right.rates, "blue", dc.merge[part1.branch.cells, ]$DPT1)
+cat.eigen.melt <- cat.eigen.obj$melt
+```
+
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+examp.eigen <- ggplot(cat.eigen.melt, aes(x=DPT, y=Eigengene, colour=Cat)) +
+  #geom_point(alpha=0.6, size=1) + 
+  stat_smooth(span=0.25) +
+  scale_colour_Publication() +
+  guides(colour=FALSE) +
+  labs(y="Eigengene Expression", x="Diffusion Pseudotime")
+
+ggsave(examp.eigen,
+       filename="~/Dropbox/Reports_Adipose/Adipogenesis2017/Figures/Exampled_GOeigen.png",
+       height=4.75, width=5.75, dpi=300)
+
+examp.eigen
+```
+
+Even with 8 groups of categories they are all still very similar in their expression.  This perhaps is no great surprise, but it demonstrates that this approach works in principal, and may just recapitulate the cluster eigengenes.
+
+### Calculating eigengenes for all enriched terms in all clusters
+
+Things to note; within each gene cluster, there needs to be record of which GO categories are collapsed together into each eigengene.
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+functional_eigengenes <- function(clusters, dataframe, go.sig.all, pseudotime, gene_map){
+  # retrieve the eigengenes for enriched functional terms within each cluster
+  # keep a record of which categories are collapsed together within each cluster
+  # return a list object containing:
+  # melted eigengene dataframe for that cluster
+  # enriched GO terms collapsed into each eigengene
+  # genes that contribute to each eigengene
+  
+  storage_obj <- list()
+  
+  cluster_names <- names(clusters)
+  for(c in seq_along(cluster_names)){
+    clust.name <- cluster_names[c]
+    clust.genes <- clusters[[clust.name]]
+    # print(clust.name)
+    # get the enriched terms first
+    clust.sig.all <- go.sig.all[go.sig.all$Cluster == clust.name, ]
+    
+    # need to handle clusters with no or a single enrichment.
+    # just calculate the eigengene for entire cluster?
+    
+    if(dim(clust.sig.all)[1] > 1){
+      clust.all <- clust.sig.all[order(clust.sig.all$padjust, decreasing=FALSE), ]
+      top.cats <- clust.all
+      top.cats <- top.cats[order(top.cats$foldEnrich, decreasing=TRUE), ]
+    
+      # for each category, pull out the respective genes
+      clust.go <- gene_map[clust.genes]
+      #clust.go <- getgo(genes=clust.genes, genome="mm10", id="ensGene", fetch.cats="GO:BP")
+    
+      # remap categories to genes, from genes to categories 
+      # using enriched categories in the cluster
+      go2gene <- list()
+      for(g in 1:length(clust.genes)){
+        gene <- clust.genes[g]
+        match.cats <- intersect(clust.go[[gene]], clust.all$category)
+        if(length(match.cats) > 0){
+          for(q in 1:length(match.cats)){
+            go2gene[[match.cats[q]]] <- c(go2gene[[match.cats[q]]], gene)
+          }
+        }
+        cat.hits <- names(go2gene)
+        }
+    
+      # calculate the proportion of shared genes between enriched categories
+      igb.df <- category_igb(go2gene, cat.hits)
+      
+      # cluster categories together, select approx. independent groups with IGB <= 0.4
+      cats.clust <- flashClust(as.dist(igb.df), method="complete")
+      collapse.cats <- cutree(cats.clust, h=0.6)
+      cat.groups <- unique(collapse.cats)
+
+      eigen.obj <- category_eigengene(cat.groups, collapse.cats, go2gene, dataframe, clust.name, pseudotime)
+      cat.eigen.melt <- eigen.obj$melt
+      eigen.genes <- eigen.obj$genes
+      
+      storage_obj[[clust.name]] <- list("eigen"=cat.eigen.melt,
+                                        "eigen.load"=eigen.genes,
+                                        "cat_clust"=collapse.cats,
+                                        "cat_genes"=go2gene)
+    }
+    else{
+      cat.eigen <- find_eigengene(dataframe[clust.genes, ])
+      
+      eigen.df <- data.frame(do.call(cbind, list(clust.name=cat.eigen)))
+      eigen.df$DPT <- pseudotime
+      eigen.melt <- melt(eigen.df, id.vars="DPT")
+      colnames(eigen.melt) <- c("DPT", "Cat", "Eigengene")
+      eigen.melt$Cat <- paste(c(clust.name, "1"), collapse=".")
+      
+      storage_obj[[clust.name]] <- list("eigen"=eigen.melt,
+                                        "eigen.load"=clust.genes,
+                                        "cat_clust"=paste(c(clust.name, "1"), collapse="."),
+                                        "cat_genes"=list("None"=clust.genes))
+    }
+    
+  }
+  return(storage_obj)
+}
+```
+
+
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+right.blue.genes <- part1.right.branch.clusters$gene_id[part1.right.branch.clusters$Cluster == "blue"]
+right.brown.genes <- part1.right.branch.clusters$gene_id[part1.right.branch.clusters$Cluster == "brown"]
+right.turquoise.genes <- part1.right.branch.clusters$gene_id[part1.right.branch.clusters$Cluster == "turquoise"]
+right.yellow.genes <- part1.right.branch.clusters$gene_id[part1.right.branch.clusters$Cluster == "yellow"]
+right.green.genes <- part1.right.branch.clusters$gene_id[part1.right.branch.clusters$Cluster == "green"]
+
+right.cluster_list <- list("blue"=right.blue.genes, "brown"=right.brown.genes,
+                           "turquoise"=right.turquoise.genes, "green"=right.green.genes, 
+                           "yellow"=right.yellow.genes)
+
+right.eigen.all <- functional_eigengenes(clusters=right.cluster_list, dataframe=part1.right.rates, gene_map=hallmark.go,
+                                         go.sig.all=part1.left.go.df, pseudotime=dc.merge[part1.branch.cells, ]$DPT1)
+```
+
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, fig.width=9, fig.height=5.25}
+# loop over the clusters and plot all of the eigengenes for each cluster
+right.melt.eigens <- data.frame(do.call(rbind, lapply(right.eigen.all, FUN=function(X) X$eigen)))
+right.melt.eigens$Cluster <- unlist(lapply(strsplit(right.melt.eigens$Cat, split=".", fixed=T),
+                                           FUN=function(Q) paste0(Q[1])))
+
+right.unique.clusters <- unique(right.melt.eigens$Cluster)
+right.eigen.map <- col2hcl(right.unique.clusters)
+names(right.eigen.map) <- right.unique.clusters
+
+right.eig.p <- ggplot(right.melt.eigens, aes(x=DPT, y=Eigengene, colour=Cluster)) +
+  stat_smooth(span=0.5, size=1, aes(group=Cat), 
+              geom="smooth", se=TRUE) +
+  theme_mike() +
+  facet_wrap(~ Cluster, ncol=2, strip.position=NULL) +
+  scale_colour_manual(values=right.eigen.map) +
+  guides(colour=FALSE) +
+  theme(strip.background = element_blank()) +
+  labs(x="Diffusion Pseudotime", y="Eigengene Expression")
+
+ggsave(right.eig.p,
+       filename="~/Dropbox/Reports_Adipose/Adipogenesis2017/Figures/Kmeans1-Pseudotime_eigengenes.png",
+       height=5.75, width=9.25, dpi=300)
+
+right.eig.p
+```
+
+These enriched functional term eigengenes suggest that within each cluster the different biological terms are changing in an approximately co-ordinated fashion.  There is variation in the magnitude of the changes, but the profiles are essentially identical.  This in itself should not come as a major surprise, as they were clustered on the average expression.
+
+Therefore, in this context it is sufficient to compare the cluster eigengenes as representative of the temporal changes in biological processes.  I had not noticed before, but the `blue` and `turquoise` clusters are quite anti-correlated, are they repressed/activated by the same process or signal?
+
+The current ordering therefore looks like this (assuming we are moving right to left along pseudotime)
+
+What are the functional enrichment categories for each cluster?
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.height=7.5, fig.width=12.5}
+right.blue.go <- hallmark.go[names(right.eigen.all$blue$cat_clust)]
+right.brown.go <- hallmark.go[names(right.eigen.all$brown$cat_clust)]
+right.turquoise.go <- hallmark.go[names(right.eigen.all$turquoise$cat_clust)]
+right.yellow.go <- hallmark.go[names(right.eigen.all$yellow$cat_clust)]
+right.green.go <- hallmark.go[names(right.eigen.all$green$cat_clust)]
+
+# plot the top 3 categories per cluster
+right.top.blue <- part1.left.go.df[part1.left.go.df$Cluster == "blue" & part1.left.go.df$padjust <= 1e-3, ]
+right.top.blue <- right.top.blue[order(right.top.blue$foldEnrich, decreasing=TRUE),]
+
+right.top.brown <- part1.left.go.df[part1.left.go.df$Cluster == "brown" & part1.left.go.df$padjust <= 1e-3, ]
+right.top.brown <- right.top.brown[order(right.top.brown$foldEnrich, decreasing=TRUE),]
+
+right.top.turquoise <- part1.left.go.df[part1.left.go.df$Cluster == "turquoise" & part1.left.go.df$padjust <= 1e-3, ]
+right.top.turquoise <- right.top.turquoise[order(right.top.turquoise$foldEnrich, decreasing=TRUE),]
+
+right.top.yellow <- part1.left.go.df[part1.left.go.df$Cluster == "yellow" & part1.left.go.df$padjust <= 1e-3, ]
+right.top.yellow <- right.top.yellow[order(right.top.yellow$foldEnrich, decreasing=TRUE),]
+
+right.top.green <- part1.left.go.df[part1.left.go.df$Cluster == "green" & part1.left.go.df$padjust <= 1e-3, ]
+right.top.green <- right.top.green[order(right.top.green$foldEnrich, decreasing=TRUE),]
+
+right.top <- do.call(rbind.data.frame,
+                     list("blue"=right.top.blue[1:4, ], "brown"=right.top.brown[1:4, ],
+                          "green"=right.top.green[1:4, ],
+                          "turquoise"=right.top.turquoise[1:4, ], "yellow"=right.top.yellow[1:4, ]))
+
+# the descriptions need to be prettified somewhat
+# remove the source i.e. first component of each term
+# if the term contains an abbreviation then that needs to be kept as all upper case
+pretty.terms <- unlist(lapply(strsplit(right.top$category, fixed=T, split="_"),
+                              FUN=function(X) str_title_case(gsub(tolower(paste(X[-1], collapse=" ")), perl=TRUE,
+                                                                  pattern="ecm", replacement="ECM"))))
+right.top$Term <- pretty.terms
+
+right.p.terms <- ggplot(na.omit(right.top),
+                        aes(x=reorder(Term, 
+                                      foldEnrich),
+           y=foldEnrich,
+           fill=-log10(padjust))) +
+  scale_fill_distiller(palette="Reds", direction=1) +
+  geom_bar(stat='identity') + theme_mike() +
+  scale_x_discrete(labels=function(X) str_wrap(X, width=35)) +
+  theme(strip.background = element_blank(),
+        strip.text=element_text(size=16),
+        axis.text.y=element_text(size=16)) +
+  coord_flip() + labs(x="Gene Ontology Term", y="Fold Enrichment") +
+  facet_wrap(~ Cluster, scales="free", ncol=2) +
+  guides(fill=guide_colourbar(title=expression(paste("-log"[10], " adjusted p-value")),
+                              title.theme=element_text(size=16, colour="black", face="bold.italic",
+                                                       family="Helvetica",
+                                                       angle=0)))
+
+ggsave(right.p.terms,
+       filename="~/Dropbox/Reports_Adipose/Adipogenesis2017/Figures/Kmeans1Pseudotime-GOenrichTop3.png",
+       height=8.75, width=15.5, dpi=300)
+
+right.p.terms
+```
+
+
+### Partition 2 pseudotime
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+# only select the DE genes from the relevant branch pseudotime-dependent analysis
+# order cells by pseudotime value
+part2.left.rates <- adipose.nz[part2.de.genes$gene_id[part2.de.genes$Sig == 1],
+                               intersect(part2.left.branch.cells, colnames(adipose.nz))]
+part2.left.rates <- part2.left.rates[, part2.left.branch.cells]
+```
+
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+# read in the clustering information already performed on the left-branch DE genes
+part2.left.branch.clusters <- read.table("~/Dropbox/Adipose/Adipose_LeftPseudotime_DEgenes-clusters-Kmeans2.tsv",
+                                         sep="\t", h=TRUE, stringsAsFactors=FALSE)
+```
+
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+part2.left.blue.genes <- part2.left.branch.clusters$gene_id[part2.left.branch.clusters$Cluster == "blue"]
+part2.left.brown.genes <- part2.left.branch.clusters$gene_id[part2.left.branch.clusters$Cluster == "brown"]
+part2.left.turquoise.genes <- part2.left.branch.clusters$gene_id[part2.left.branch.clusters$Cluster == "turquoise"]
+part2.left.yellow.genes <- part2.left.branch.clusters$gene_id[part2.left.branch.clusters$Cluster == "yellow"]
+part2.left.green.genes <- part2.left.branch.clusters$gene_id[part2.left.branch.clusters$Cluster == "green"]
+part2.left.red.genes <- part2.left.branch.clusters$gene_id[part2.left.branch.clusters$Cluster == "red"]
+part2.left.black.genes <- part2.left.branch.clusters$gene_id[part2.left.branch.clusters$Cluster == "black"]
+part2.left.pink.genes <- part2.left.branch.clusters$gene_id[part2.left.branch.clusters$Cluster == "pink"]
+part2.left.grey.genes <- part2.left.branch.clusters$gene_id[part2.left.branch.clusters$Cluster == "grey"]
+
+part2.left.cluster_list <- list("blue"=part2.left.blue.genes, "brown"=part2.left.brown.genes,
+                                "turquoise"=part2.left.turquoise.genes, "yellow"=part2.left.yellow.genes,
+                                "red"=part2.left.red.genes, "green"=part2.left.green.genes,
+                                "pink"=part2.left.pink.genes, "grey"=part2.left.grey.genes,
+                                "black"=part2.left.black.genes)
+
+part2.left.eigen.all <- functional_eigengenes(clusters=part2.left.cluster_list, dataframe=part2.left.rates, gene_map=hallmark.go,
+                                              go.sig.all=part2.left.go.df, pseudotime=dc.merge[part2.left.branch.cells, ]$DPT1)
+```
+
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, fig.width=9, fig.height=5.25}
+# loop over the clusters and plot all of the eigengenes for each cluster
+part2.left.melt.eigens <- data.frame(do.call(rbind, lapply(part2.left.eigen.all, FUN=function(X) X$eigen)))
+part2.left.melt.eigens$Cluster <- unlist(lapply(strsplit(part2.left.melt.eigens$Cat, split=".", fixed=T),
+                                           FUN=function(Q) paste0(Q[1])))
+
+part2.left.unique.clusters <- unique(part2.left.melt.eigens$Cluster)
+part2.left.eigen.map <- col2hcl(part2.left.unique.clusters)
+names(part2.left.eigen.map) <- part2.left.unique.clusters
+
+part2.left.eig.p <- ggplot(part2.left.melt.eigens, aes(x=DPT, y=Eigengene, colour=Cluster)) +
+  stat_smooth(span=0.5, size=1, aes(group=Cat), 
+              geom="smooth", se=TRUE) +
+  theme_mike() +
+  facet_wrap(~ Cluster, ncol=3, strip.position=NULL) +
+  scale_colour_manual(values=part2.left.eigen.map) +
+  guides(colour=FALSE) +
+  theme(strip.background = element_blank()) +
+  labs(x="Diffusion Pseudotime", y="Eigengene Expression")
+
+ggsave(part2.left.eig.p,
+       filename="~/Dropbox/Reports_Adipose/Adipogenesis2017/Figures/LeftPseudotime-Kmeans2-eigengenes.png",
+       height=5.75, width=9.25, dpi=300)
+
+part2.left.eig.p
+```
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.height=7.5, fig.width=12.5}
+go.terms <- Term(GO.db::GOTERM)
+part2.left.blue.go <- go.terms[names(part2.left.eigen.all$blue$cat_clust)]
+part2.left.brown.go <- go.terms[names(part2.left.eigen.all$brown$cat_clust)]
+part2.left.turquoise.go <- go.terms[names(part2.left.eigen.all$turquoise$cat_clust)]
+part2.left.yellow.go <- go.terms[names(part2.left.eigen.all$yellow$cat_clust)]
+part2.left.red.go <- go.terms[names(part2.left.eigen.all$red$cat_clust)]
+part2.left.green.go <- go.terms[names(part2.left.eigen.all$green$cat_clust)]
+part2.left.pink.go <- go.terms[names(part2.left.eigen.all$pink$cat_clust)]
+part2.left.black.go <- go.terms[names(part2.left.eigen.all$black$cat_clust)]
+part2.left.grey.go <- go.terms[names(part2.left.eigen.all$grey$cat_clust)]
+
+# plot the top 3 categories per cluster
+part2.left.top.blue <- part2.left.go.df[part2.left.go.df$Cluster == "blue" & part2.left.go.df$padjust <= 1e-3, ]
+part2.left.top.blue <- part2.left.top.blue[order(part2.left.top.blue$foldEnrich, decreasing=TRUE),]
+
+part2.left.top.brown <- part2.left.go.df[part2.left.go.df$Cluster == "brown" & part2.left.go.df$padjust <= 1e-3, ]
+part2.left.top.brown <- part2.left.top.brown[order(part2.left.top.brown$foldEnrich, decreasing=TRUE),]
+
+part2.left.top.turquoise <- part2.left.go.df[part2.left.go.df$Cluster == "turquoise" & part2.left.go.df$padjust <= 1e-3, ]
+part2.left.top.turquoise <- part2.left.top.turquoise[order(part2.left.top.turquoise$foldEnrich, decreasing=TRUE),]
+
+part2.left.top.yellow <- part2.left.go.df[part2.left.go.df$Cluster == "yellow" & part2.left.go.df$padjust <= 1e-3, ]
+part2.left.top.yellow <- part2.left.top.yellow[order(part2.left.top.yellow$foldEnrich, decreasing=TRUE),]
+
+part2.left.top.red <- part2.left.go.df[part2.left.go.df$Cluster == "red" & part2.left.go.df$padjust <= 1e-3, ]
+part2.left.top.red <- part2.left.top.red[order(part2.left.top.red$foldEnrich, decreasing=TRUE),]
+
+part2.left.top.green <- part2.left.go.df[part2.left.go.df$Cluster == "green" & part2.left.go.df$padjust <= 1e-3, ]
+part2.left.top.green <- part2.left.top.green[order(part2.left.top.green$foldEnrich, decreasing=TRUE),]
+
+part2.left.top.pink <- part2.left.go.df[part2.left.go.df$Cluster == "pink" & part2.left.go.df$padjust <= 1e-3, ]
+part2.left.top.pink <- part2.left.top.pink[order(part2.left.top.pink$foldEnrich, decreasing=TRUE),]
+
+part2.left.top.grey <- part2.left.go.df[part2.left.go.df$Cluster == "grey" & part2.left.go.df$padjust <= 1e-3, ]
+part2.left.top.grey <- part2.left.top.grey[order(part2.left.top.grey$foldEnrich, decreasing=TRUE),]
+
+part2.left.top.black <- part2.left.go.df[part2.left.go.df$Cluster == "black" & part2.left.go.df$padjust <= 1e-3, ]
+part2.left.top.black <- part2.left.top.black[order(part2.left.top.black$foldEnrich, decreasing=TRUE),]
+
+
+part2.left.top <- do.call(rbind.data.frame,
+                     list("blue"=part2.left.top.blue[1:5, ], "brown"=part2.left.top.brown[1:5, ],
+                          "turquoise"=part2.left.top.turquoise[1:5, ], "yellow"=part2.left.top.yellow[1:5, ],
+                          "red"=part2.left.top.red[1:5, ], "green"=part2.left.top.green[1:5, ],
+                          "black"=part2.left.top.black[1:5, ], "green"=part2.left.top.grey[1:5, ],
+                          "pink"=part2.left.top.pink[1:5, ]))
+
+pretty.terms <- unlist(lapply(strsplit(part2.left.top$category, fixed=T, split="_"),
+                              FUN=function(X) str_title_case(gsub(tolower(paste(X[-1], collapse=" ")), perl=TRUE,
+                                                                  pattern="ecm", replacement="ECM"))))
+part2.left.top$Term <- pretty.terms
+part2.left.top <- na.omit(part2.left.top)
+
+part2.left.top <- part2.left.top[order(part2.left.top$foldEnrich), ]
+part2.left.top$Term <- factor(part2.left.top$Term,
+                              levels=unique(part2.left.top$Term),
+                              labels=unique(part2.left.top$Term))
+# 0 pvalues need to be set to the minimum representation
+part2.left.top$padjust[part2.left.top$padjust == 0] <- .Machine$double.xmin
+
+part2.left.p.terms <- ggplot(part2.left.top,
+                        aes(x=Term,
+                            y=foldEnrich,
+                            fill=-log10(padjust))) +
+  scale_fill_distiller(palette="Reds", direction=1) +
+  geom_bar(stat='identity') + theme_mike() +
+  scale_x_discrete(labels=function(X) str_wrap(X, width=35)) +
+  theme(strip.background = element_blank(),
+        strip.text=element_text(size=16),
+        axis.text.y=element_text(size=16)) +
+  coord_flip() + labs(x="Gene Ontology Term", y="Fold Enrichment") +
+  facet_wrap(~ Cluster, scales="free", ncol=2) +
+  guides(fill=guide_colourbar(title=expression(paste("-log"[10], " adjusted p-value")),
+                              title.theme=element_text(size=16, colour="black", face="bold.italic",
+                                                       family="Helvetica",
+                                                       angle=0)))
+
+ggsave(part2.left.p.terms,
+       filename="~/Dropbox/Reports_Adipose/Adipogenesis2017/Figures/LeftPsuedotime-GOenrichTop3-Kmeans2.png",
+       height=8.75, width=15.5, dpi=300)
+
+part2.left.p.terms
+```
+
+There are quite a lot of changes in gene expression along each pseudotime branch and trajectory.  Within a branch or trajectory, how lagged are 
+the gene expression changes between modules?
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+part1.right.eigen.ccf.list <- list()
+
+part1.right.clusters <- unique(right.melt.eigens$Cat)
+
+# set the maximum lag to 75% of all cells
+lag.max <- dim(right.melt.eigens[right.melt.eigens$Cat == "blue.1", ])[1] * 0.95
+
+for(i in seq_along(part1.right.clusters)){
+  i.list <- list()
+  for(j in seq_along(part1.right.clusters)){
+    xcor <- ccf(x=as.numeric(right.melt.eigens$Eigengene[right.melt.eigens$Cat == part1.right.clusters[i]]),
+                y=as.numeric(right.melt.eigens$Eigengene[right.melt.eigens$Cat == part1.right.clusters[j]]),
+                plot=FALSE,
+                lag.max=lag.max)
+    i.list[[part1.right.clusters[j]]] <- xcor
+  }
+  part1.right.eigen.ccf.list[[part1.right.clusters[i]]] <- i.list
+}
+
+part1.right.eigen.lag.list <- list()
+for(i in 1:length(part1.right.clusters)){
+  i.lags <- list()
+  for(j in 1:length(part1.right.clusters)){
+    ccf.obj <- part1.right.eigen.ccf.list[[part1.right.clusters[i]]][[part1.right.clusters[j]]]
+    lag <- ccf.obj$lag
+    max.cor <- max(abs(ccf.obj$acf))
+    max.idx <- which(abs(ccf.obj$acf) == max.cor)
+    max.lag <- lag[max.idx]
+    i.lags[[part1.right.clusters[j]]] <- max.lag
+  }
+  part1.right.eigen.lag.list[[part1.right.clusters[i]]] <- i.lags
+}
+
+part1.right.eigen.lag.df <- data.frame(lapply(part1.right.eigen.lag.list, unlist))
+# show only the upper triangle
+part1.right.eigen.hm <- as.matrix(part1.right.eigen.lag.df/max(abs(part1.right.eigen.lag.df)))
+part1.right.eigen.hm[lower.tri(part1.right.eigen.hm, diag=TRUE)] <- NA
+
+colnames(part1.right.eigen.hm) <- colnames(part1.right.eigen.lag.df)
+rownames(part1.right.eigen.hm) <- rownames(part1.right.eigen.lag.df)
+
+hm.cols <- rev(colorRampPalette(brewer.pal(9, "RdGy"))(100))
+
+pheatmap(part1.right.eigen.hm,
+         cluster_rows=FALSE, cluster_cols=FALSE,
+         color=hm.cols, breaks=seq(-1, 1, by=0.02),
+         filename="~/Dropbox/Reports_Adipose/Adipogenesis2017/Figures/Kmeans1Pseudotime-XCor_eigengene-heatmap.png",
+         height=4.25, width=5.25, res=300)
+```
+
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+part2.left.eigen.ccf.list <- list()
+
+part2.left.clusters <- unique(part2.left.melt.eigens$Cat)
+
+# set the maximum lag to 75% of all cells
+lag.max <- dim(part2.left.melt.eigens[part2.left.melt.eigens$Cat == "blue.1", ])[1] * 0.95
+
+for(i in seq_along(part2.left.clusters)){
+  i.list <- list()
+  for(j in seq_along(part2.left.clusters)){
+    xcor <- ccf(x=as.numeric(part2.left.melt.eigens$Eigengene[part2.left.melt.eigens$Cat == part2.left.clusters[i]]),
+                y=as.numeric(part2.left.melt.eigens$Eigengene[part2.left.melt.eigens$Cat == part2.left.clusters[j]]),
+                plot=FALSE,
+                lag.max=lag.max)
+    i.list[[part2.left.clusters[j]]] <- xcor
+  }
+  part2.left.eigen.ccf.list[[part2.left.clusters[i]]] <- i.list
+}
+
+part2.left.eigen.lag.list <- list()
+for(i in 1:length(part2.left.clusters)){
+  i.lags <- list()
+  for(j in 1:length(part2.left.clusters)){
+    ccf.obj <- part2.left.eigen.ccf.list[[part2.left.clusters[i]]][[part2.left.clusters[j]]]
+    lag <- ccf.obj$lag
+    max.cor <- max(abs(ccf.obj$acf))
+    max.idx <- which(abs(ccf.obj$acf) == max.cor)
+    max.lag <- lag[max.idx]
+    i.lags[[part2.left.clusters[j]]] <- max.lag
+  }
+  part2.left.eigen.lag.list[[part2.left.clusters[i]]] <- i.lags
+}
+
+part2.left.eigen.lag.df <- data.frame(lapply(part2.left.eigen.lag.list, unlist))
+# show only the upper triangle
+part2.left.eigen.hm <- as.matrix(part2.left.eigen.lag.df/max(abs(part2.left.eigen.lag.df)))
+part2.left.eigen.hm[lower.tri(part2.left.eigen.hm, diag=TRUE)] <- NA
+
+colnames(part2.left.eigen.hm) <- colnames(part2.left.eigen.lag.df)
+rownames(part2.left.eigen.hm) <- rownames(part2.left.eigen.lag.df)
+
+pheatmap(part2.left.eigen.hm,
+         cluster_rows=FALSE, cluster_cols=FALSE,
+         color=hm.cols, breaks=seq(-1, 1, by=0.02),
+         filename="~/Dropbox/Reports_Adipose/Adipogenesis2017/Figures/Kmeans2Pseudotime-XCor_eigengene-heatmap.png",
+         height=4.25, width=5.25, res=300)
+```
+
+
+## EMT genes during adipocyte development
+
+### Partition 1 - Right branch 
+There are a set of genes implicated as either controllers of, early events in, EMT.  These genes are:
+
+* _Snai1_, _Snai2_, _Lox_, _Twist_, _Cdh1_, _Cdh2_, _Zeb2_
+* _Vim_, _Cdh_ - mesenchyme markers
+* _Fn1_ - loss of fibronectin is associated with MET.
+
+The yellow cluster of genes along the right-hand branch of the pseudotime contains lots of enrichments for motility and adhesion, thus it represents the best set of MET candidate genes.
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+# define MET genes as the ones in the HALLMARK_EMT signature
+c.met.genes <- unique(hallmark.merge$ensembl_gene_id[hallmark.merge$GeneSet == "HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION"])
+```
+
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.width=7.75, fig.height=9.75}
+part1.left.go.df <- na.omit(part1.left.go.df)
+pretty.terms <- unlist(lapply(strsplit(part1.left.go.df$category, fixed=T, split="_"),
+                              FUN=function(X) str_title_case(gsub(tolower(paste(X[-1], collapse=" ")), perl=TRUE,
+                                                                  pattern="ecm", replacement="ECM"))))
+part1.left.go.df$Term <- pretty.terms
+
+right.brown.p.terms <- ggplot(part1.left.go.df[(part1.left.go.df$Cluster == "turquoise") &
+                                                          (part1.left.go.df$padjust <= 1.e-2), ],
+                        aes(x=reorder(Term, 
+                                      foldEnrich),
+           y=foldEnrich,
+           fill=-log10(padjust))) +
+  scale_fill_distiller(palette="Reds", direction=1) +
+  geom_bar(stat='identity') + theme_mike() +
+  scale_x_discrete(labels=function(X) str_wrap(X, width=35)) +
+  theme(strip.background = element_blank(),
+        strip.text=element_text(size=16),
+        axis.text.y=element_text(size=16)) +
+  coord_flip() + labs(x="Gene Ontology Term", y="Fold Enrichment")
+
+ggsave(right.brown.p.terms,
+       filename="~/Dropbox/Reports_Adipose/Adipogenesis2017/Figures/TurquoiseMET_Kmeans1Pseudotime-GOenrichTop3.png",
+       height=8.75, width=7.75, dpi=300)
+
+right.brown.p.terms
+```
+
+
+```{r, echo=FALSE, warning=part1.left.go.df, message=FALSE}
+GO.all <- part1.left.go.df[part1.left.go.df$Cluster == "turquoise", ]
+top.cats <- GO.all
+top.cats <- top.cats[order(top.cats$foldEnrich, decreasing=TRUE), ]
+
+# retrieve all GO categories for the cluster genes
+# returns a list of genes and their GO categories
+brown.genes <- part1.right.branch.clusters$gene_id[part1.right.branch.clusters$Cluster == "turquoise"]
+brown.go   <- hallmark.go[brown.genes]
+#brown.go <- getgo(genes=brown.genes, genome="mm10", id="ensGene", fetch.cats="GO:BP")
+
+go2gene <- list()
+# for each category, pull out the respective genes
+# get the expression for those genes
+# calculate the eigengene over the pseudotime-ordered expresison for those genes
+for(g in 1:length(brown.genes)){
+  gene <- brown.genes[g]
+  match.cats <- intersect(brown.go[[gene]], GO.all$category)
+  if(length(match.cats) > 0){
+    for(c in 1:length(match.cats)){
+      go2gene[[match.cats[c]]] <- c(go2gene[[match.cats[c]]], gene)
+    }
+  }
+}
+
+cat.hits <- names(go2gene)
+go2eigen <- list()
+for(i in 1:length(cat.hits)){
+  go.genes <- go2gene[[cat.hits[i]]]
+  go.fit <- part1.right.rates[go.genes, ]
+  go.eigen <- find_eigengene(go.fit)
+  go2eigen[[cat.hits[i]]] <- go.eigen
+}
+
+go.eigen.df <- data.frame(do.call(cbind, go2eigen))
+colnames(go.eigen.df) <- cat.hits
+go.eigen.df$DPT <- dc.merge[part1.branch.cells, ]$DPT1
+
+go.eigen.melt <- melt(go.eigen.df, id.vars="DPT")
+colnames(go.eigen.melt) <- c("DPT", "Cat", "Eigengene")
+```
+
+Maybe represent this as a heatmap of the brown genes or eigengenes over pseudotime?
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.height=4.75, fig.width=9.75}
+rownames(GO.all) <- GO.all$category
+
+brown.go.hm <- as.data.frame(t(go.eigen.df[, 1:(dim(go.eigen.df)[2]-1)]))
+brown.go.hm <- brown.go.hm[, order(go.eigen.df$DPT)]
+# remove duplicate enriched terms
+rownames(brown.go.hm) <- str_wrap(GO.all[rownames(brown.go.hm), ]$Term, width=45)
+
+dpt.frame <- cbind.data.frame(go.eigen.df$DPT)
+colnames(dpt.frame) <- "DPT"
+rownames(dpt.frame) <- part1.branch.cells
+colnames(brown.go.hm) <- part1.branch.cells
+brown.go.hm <- brown.go.hm[, order(go.eigen.df$DPT)]
+
+dc.cols <- colorRampPalette(c("#FAFF60", "#8615B0"))(dim(dpt.frame)[1])
+names(dc.cols) <- dpt.frame$DPT
+
+pheatmap(brown.go.hm,
+         annotation_col=dpt.frame, 
+         annotation_colors=list("DPT"=dc.cols),
+         show_colnames=FALSE, fontsize_row=12,
+         cluster_cols=FALSE,
+         filename="~/Dropbox/Reports_Adipose/Adipogenesis2017/Figures/TurquoiseMET_GOenrich-Kmeans1Pseudotime-heatmap.png",
+         height=8.75, width=10.75, res=300)
+```
+
+What are the genes driving this MET?  They should be the genes in these categories that are mostly strongly loaded on the individual eigengenes/highest fold change over pseudotime.
+
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+# met.go <- GO.all[grepl(GO.all$term, 
+#                        pattern="(ERK)|(migration)|(locomotion)|(adhesion)|(motility)|(local)|(lipid)"),  ]$category
+met.go <- GO.all[grepl(GO.all$Term, 
+                       pattern="(Mesenchymal)"),  ]$category
+
+# get the right eigenvectors (loadings)
+cat.hits <- names(go2gene)
+cat.hits <- cat.hits[cat.hits %in% met.go]
+
+go2loading <- list()
+met.genes <- c()
+for(i in 1:length(cat.hits)){
+  go.genes <- go2gene[[cat.hits[i]]]
+  go.fit <- part1.right.rates[go.genes, ]
+  go.load <- find_eigengene(go.fit, side="right")
+  names(go.load) <- go.genes
+  met.genes <- c(met.genes, go.genes)
+  go.df <- cbind.data.frame(names(go.load), go.load)
+  colnames(go.df) <- c("gene_id", "loading")
+  go.df$GO <- unlist(lapply(strsplit(cat.hits[i], fixed=T, split="_"),
+                              FUN=function(X) str_title_case(gsub(tolower(paste(X[-1], collapse=" ")), perl=TRUE,
+                                                                  pattern="ecm", replacement="ECM"))))
+  go2loading[[cat.hits[i]]] <- go.df
+}
+
+go.loading.df <- data.frame(do.call(rbind.data.frame, go2loading))
+```
+
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.width=9.75, fig.height=8.75}
+# annotate each gene based on which GO category it falls into
+# select just the MET related categories
+cluster.genes <- part1.right.branch.clusters$gene_id[part1.right.branch.clusters$Cluster == "turquoise"]
+# uncomment these lines to restrict to the cluster genes
+# brown.MET.genes <- part1.right.de.genes$gene_id[part1.right.de.genes$gene_id %in% c.met.genes &
+#                                                   part1.right.de.genes$Sig == 1 & abs(part1.right.de.genes$logFC) > 1 &
+#                                                   part1.right.de.genes$gene_id %in% cluster.genes]
+brown.MET.genes <- part1.de.genes$gene_id[part1.de.genes$gene_id %in% c.met.genes &
+                                                  part1.de.genes$Sig == 1]
+part1.right.min.lfc <- part2.de.genes$gene_id[part2.de.genes$Sig == 1 & abs(part2.de.genes$logFC) > 2]
+
+
+brown.MET.exprs <- part1.right.rates[brown.MET.genes, ]
+# rownames(brown.MET.exprs) <- part1.right.de.genes$external_gene_name[part1.right.de.genes$gene_id %in% c.met.genes & 
+#                                                                        part1.right.de.genes$Sig == 1 & abs(part1.right.de.genes$logFC) > 1 &
+#                                                                        part1.right.de.genes$gene_id %in% cluster.genes]
+rownames(brown.MET.exprs) <- part1.de.genes$external_gene_name[part1.de.genes$gene_id %in% c.met.genes &
+                                                                       part1.de.genes$Sig == 1]
+
+
+# map genes to go terms
+gene.frame <- do.call(cbind.data.frame,
+                      list("symbol"=rownames(brown.MET.exprs),
+                           "gene_id"=brown.MET.genes))
+go.frame <- merge(gene.frame, go.loading.df, by='gene_id')
+go.frame <- merge(go.frame, GO.all, by.x='GO', by.y='Term')
+go.frame <- go.frame[!duplicated(go.frame$gene_id), ]
+
+# remove duplicated symbols
+row.frame <- go.frame[, c("GO", "symbol")]
+rownames(row.frame) <- row.frame$symbol
+row.annot <- as.data.frame(row.frame[, 1])
+rownames(row.annot) <- row.frame$symbol
+colnames(row.annot) <- "Term"
+
+term.cols <- c("#FF0000")
+names(term.cols) <- unique(row.annot$Term)
+brown.MET.exprs <- brown.MET.exprs[, order(go.eigen.df$DPT)]
+
+part1.right.dpt <- go.eigen.df$DPT
+part1.right.brownMET <- rownames(brown.MET.exprs)
+pheatmap(brown.MET.exprs[rownames(row.annot)[order(row.annot$Term)], ],
+         annotation_col=dpt.frame, annotation_colors=list("DPT"=dc.cols,
+                                                          "Term"=term.cols),
+         annotation_row=row.annot,
+         show_colnames=FALSE, fontsize_row=14,
+         cluster_cols=FALSE, cluster_rows=FALSE,
+         filename="~/Dropbox/Reports_Adipose/Adipogenesis2017/Figures/METgenes_Kmeans1-heatmap.png",
+         height=8.75, width=9.75, res=300)
+```
+
+
+### Partition 2
+
+The yellow cluster of genes along the left-hand branch of the pseudotime contains lots of enrichments for motility and adhesion, thus it represents the best set of MET candidate genes.
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.width=7.75, fig.height=9.75}
+part2.left.go.df <- na.omit(part2.left.go.df)
+pretty.terms <- unlist(lapply(strsplit(part2.left.go.df$category, fixed=T, split="_"),
+                              FUN=function(X) str_title_case(gsub(tolower(paste(X[-1], collapse=" ")), perl=TRUE,
+                                                                  pattern="ecm", replacement="ECM"))))
+part2.left.go.df$Term <- pretty.terms
+
+part2.brown.p.terms <- ggplot(na.omit(part2.left.go.df[(part2.left.go.df$Cluster == "turquoise") &
+                                                          (part2.left.go.df$padjust <= 1.e-2), ][1:20, ]),
+                        aes(x=reorder(Term, 
+                                      foldEnrich),
+           y=foldEnrich,
+           fill=-log10(padjust))) +
+  scale_fill_distiller(palette="Reds", direction=1) +
+  geom_bar(stat='identity') + theme_mike() +
+  scale_x_discrete(labels=function(X) str_wrap(X, width=45)) +
+  theme(strip.background = element_blank(),
+        strip.text=element_text(size=18),
+        axis.text.y=element_text(size=18)) +
+  coord_flip() + labs(x="Gene Ontology Term", y="Fold Enrichment")
+
+ggsave(part2.brown.p.terms,
+       filename="~/Dropbox/Reports_Adipose/Adipogenesis2017/Figures/YellowMET_LeftPsuedotime-Kmeans2-GOenrichTop3.png",
+       height=8.75, width=7.75, dpi=300)
+
+part2.brown.p.terms
+```
+
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+GO.all <- part2.left.go.df[part2.left.go.df$Cluster == "brown", ]
+top.cats <- GO.all
+top.cats <- top.cats[order(top.cats$foldEnrich, decreasing=TRUE), ]
+
+# retrieve all GO categories for the cluster genes
+# returns a list of genes and their GO categories
+brown.genes <- part2.left.branch.clusters$gene_id[part2.left.branch.clusters$Cluster == "brown"]
+brown.go <- na.omit(hallmark.go[brown.genes])
+# brown.go <- getgo(genes=brown.genes, genome="mm10", id="ensGene", fetch.cats="GO:BP")
+
+go2gene <- list()
+# for each category, pull out the respective genes
+# get the expression for those genes
+# calculate the eigengene over the pseudotime-ordered expresison for those genes
+for(g in 1:length(brown.genes)){
+  gene <- brown.genes[g]
+  match.cats <- intersect(brown.go[[gene]], GO.all$category)
+  if(length(match.cats) > 0){
+    for(c in 1:length(match.cats)){
+      go2gene[[match.cats[c]]] <- c(go2gene[[match.cats[c]]], gene)
+    }
+  }
+}
+
+cat.hits <- names(go2gene)
+go2eigen <- list()
+for(i in 1:length(cat.hits)){
+  go.genes <- go2gene[[cat.hits[i]]]
+  go.fit <- part2.left.rates[go.genes, ]
+  go.eigen <- find_eigengene(go.fit)
+  go2eigen[[cat.hits[i]]] <- go.eigen
+}
+
+go.eigen.df <- data.frame(do.call(cbind, go2eigen))
+colnames(go.eigen.df) <- cat.hits
+go.eigen.df$DPT <- dc.merge[part2.left.branch.cells, ]$DPT1
+
+go.eigen.melt <- melt(go.eigen.df, id.vars="DPT")
+colnames(go.eigen.melt) <- c("DPT", "Cat", "Eigengene")
+```
+
+Maybe represent this as a heatmap of the brown genes or eigengenes over pseudotime?
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.height=4.75, fig.width=9.75}
+rownames(GO.all) <- GO.all$category
+
+brown.go.hm <- as.data.frame(t(go.eigen.df[, 1:(dim(go.eigen.df)[2]-1)]))
+brown.go.hm <- brown.go.hm[, order(go.eigen.df$DPT)]
+rownames(brown.go.hm) <- str_wrap(GO.all[rownames(brown.go.hm), ]$Term, width=45)
+
+dpt.frame <- cbind.data.frame(go.eigen.df$DPT)
+colnames(dpt.frame) <- "DPT"
+rownames(dpt.frame) <- part2.left.branch.cells
+colnames(brown.go.hm) <- part2.left.branch.cells
+brown.go.hm <- brown.go.hm[, order(go.eigen.df$DPT)]
+
+dc.cols <- colorRampPalette(c("#FAFF60", "#8615B0"))(dim(dpt.frame)[1])
+names(dc.cols) <- dpt.frame$DPT
+
+pheatmap(brown.go.hm,
+         annotation_col=dpt.frame, 
+         annotation_colors=list("DPT"=dc.cols),
+         show_colnames=FALSE, fontsize_row=12,
+         cluster_cols=FALSE,
+         filename="~/Dropbox/Reports_Adipose/Adipogenesis2017/Figures/TurquoiseMET_GOenrich-Kmeans2-heatmap.png",
+         height=8.75, width=10.75, res=300)
+```
+
+What are the genes driving this MET?  They should be the genes in these categories that are mostly strongly loaded on the individual eigengenes/highest fold change over pseudotime.
+
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+met.go <- GO.all[grepl(GO.all$Term, 
+                       pattern="(Mesenchymal)"),  ]$category
+# get the left eigenvectors (loadings)
+cat.hits <- names(go2gene)
+cat.hits <- cat.hits[cat.hits %in% met.go]
+
+go2loading <- list()
+met.genes <- c()
+for(i in 1:length(cat.hits)){
+  go.genes <- go2gene[[cat.hits[i]]]
+  go.fit <- part2.left.rates[go.genes, ]
+  go.load <- find_eigengene(go.fit, side="left")
+  names(go.load) <- go.genes
+  met.genes <- c(met.genes, go.genes)
+  go.df <- cbind.data.frame(names(go.load), go.load)
+  colnames(go.df) <- c("gene_id", "loading")
+  go.df$GO <- unlist(lapply(strsplit(cat.hits[i], fixed=T, split="_"),
+                              FUN=function(X) str_title_case(gsub(tolower(paste(X[-1], collapse=" ")), perl=TRUE,
+                                                                  pattern="ecm", replacement="ECM"))))
+  go2loading[[cat.hits[i]]] <- go.df
+}
+
+go.loading.df <- data.frame(do.call(rbind.data.frame, go2loading))
+```
+
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.width=9.75, fig.height=8.75}
+# annotate each gene based on which GO category it falls into
+# select just the MET related GO categories
+cluster.genes <- part2.left.branch.clusters$gene_id[part2.left.branch.clusters$Cluster == "turquoise"]
+
+# uncomment these lines to restrict to enriched cluster genes
+# brown.MET.genes <- part2.de.genes$gene_id[part2.de.genes$gene_id %in% c.met.genes &
+#                                             part2.de.genes$Sig == 1 & abs(part2.de.genes$logFC) > 1 &
+#                                             part2.de.genes$gene_id %in% cluster.genes]
+part2.left.min.lfc <- part2.de.genes$gene_id[part2.de.genes$Sig == 1 & abs(part2.de.genes$logFC) > 2]
+
+brown.MET.genes <- part2.de.genes$gene_id[part2.de.genes$gene_id %in% c.met.genes &
+                                            part2.de.genes$Sig == 1]
+brown.MET.exprs <- part2.left.rates[brown.MET.genes, ]
+rownames(brown.MET.exprs) <- part2.de.genes$external_gene_name[part2.de.genes$gene_id %in% c.met.genes & 
+                                                                 part2.de.genes$Sig == 1]
+
+# map genes to go terms
+gene.frame <- do.call(cbind.data.frame,
+                      list("symbol"=rownames(brown.MET.exprs),
+                           "gene_id"=brown.MET.genes))
+go.frame <- merge(gene.frame, go.loading.df, by='gene_id')
+go.frame <- merge(go.frame, GO.all, by.x='GO', by.y='Term')
+go.frame <- go.frame[!duplicated(go.frame$gene_id), ]
+# remove duplicated symbols
+row.frame <- go.frame[, c("GO", "symbol")]
+rownames(row.frame) <- row.frame$symbol
+row.annot <- as.data.frame(row.frame[, 1])
+rownames(row.annot) <- row.frame$symbol
+colnames(row.annot) <- "Term"
+
+term.cols <- c("#FF0000")
+names(term.cols) <- unique(row.annot$Term)
+brown.MET.exprs <- brown.MET.exprs[, order(go.eigen.df$DPT)]
+part2.left.dpt <- go.eigen.df$DPT
+part2.left.brownMET <- rownames(brown.MET.exprs)
+
+pheatmap(brown.MET.exprs[rownames(row.annot)[order(row.annot$Term)], ],
+         annotation_col=dpt.frame, annotation_colors=list("DPT"=dc.cols,
+                                                          "Term"=term.cols),
+         annotation_row=row.annot,
+         show_colnames=FALSE, fontsize_row=14,
+         cluster_cols=FALSE, cluster_rows=FALSE,
+         filename="~/Dropbox/Reports_Adipose/Adipogenesis2017/Figures/METgenes_leftbranch-Kmeans2-heatmap.png",
+         height=8.75, width=9.75, res=300)
+```
+
+To what degree do these three pseudotime branches overlap w.r.t. to the EMT/MET genes that are pseudotime-dependent?
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.height=5.75, fig.width=5.75}
+png("~/Dropbox/Reports_Adipose/Adipogenesis2017/Figures/MET_venndiagram.png",
+    height=5.75, width=5.75, res=300, units="in")
+vp <- viewport(height=unit(5, "inches"),
+               width=unit(5, "inches"),
+               layout.pos.col=1, layout.pos.row=1)
+pushViewport(vp)
+
+
+met.venn <- draw.pairwise.venn(area1=length(part1.right.brownMET),
+                               area2=length(part2.left.brownMET),
+                               cross.area=length(intersect(part1.right.brownMET, part2.left.brownMET)),
+                               category=c("Partition 1", "Partition 2"),
+                               lwd=rep(1.5, 2), fill=c("purple", "orange"),
+                               col=rep("black", 2), alpha=rep(0.5, 2),
+                               fontface=rep("bold", 3),
+                               cat.fontface=rep("bold", 2), cex=rep(2, 3),
+                               cat.cex=rep(1.5, 2), cat.pos=c(-10, 10),
+                               cat.dist=rep(0.1, 2),
+                               euler.d=TRUE, scaled=FALSE,
+                               fontfamily=rep("Helvetica", 3))
+grid.draw(met.venn)
+dev.off()
+grid.newpage()
+grid.draw(met.venn)
+```
+
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.height=8.75, fig.width=11.75}
+# create a heatmap of MET gene
+# annotate each gene based on which GO category it falls into
+# select just the MET related GO categories
+
+# restrict heatmap to genes with |lfChange| > 2
+all.lfc <- unique(c(part1.right.min.lfc, part2.left.min.lfc))
+
+all.MET.genes.symbol.exprs <- unique(c(part1.right.brownMET, part2.left.brownMET))
+all.MET.genes.id <- gene_symbol$ensembl_gene_id[gene_symbol$external_gene_name %in% all.MET.genes.symbol.exprs]
+
+# select with min LFC
+all.MET.genes.id <- all.MET.genes.id[all.MET.genes.id %in% all.lfc]
+all.MET.genes.symbol <- gene_symbol$external_gene_name[(gene_symbol$ensembl_gene_id %in% all.MET.genes.id) &
+                                                         (gene_symbol$external_gene_name %in% all.MET.genes.symbol.exprs)]
+
+right.MET.exprs <- adipose.nz[all.MET.genes.id, intersect(colnames(adipose.nz), part1.branch.cells)]
+right.MET.exprs <- right.MET.exprs[, order(dc.merge[colnames(right.MET.exprs), ]$DPT1, decreasing=TRUE)]
+
+part2.MET.exprs <-  adipose.nz[all.MET.genes.id, intersect(colnames(adipose.nz), part2.left.branch.cells)]
+part2.MET.exprs <- part2.MET.exprs[, order(dc.merge[colnames(part2.MET.exprs), ]$DPT1, decreasing=TRUE)]
+
+# order each by their respective pseudotimes 
+# some of the cluster 2 cells will be duplicated for the left and right branches
+MET.exprs <- do.call(cbind.data.frame,
+                     list("Part1"=right.MET.exprs,
+                          "Part2"=part2.MET.exprs))
+rownames(MET.exprs) <- all.MET.genes.symbol
+
+# assign genes to which branch they are specifically DE in
+part1.right.brownMET <- rownames(right.MET.exprs)
+part2.left.brownMET <- rownames(part2.MET.exprs)
+
+
+right.spec <- setdiff(part1.right.brownMET, unique(part2.left.brownMET))
+partt2.spec <- setdiff(part2.left.brownMET, unique(part1.right.brownMET))
+
+gene.frame <- do.call(cbind.data.frame,
+                      list("symbol"=rownames(MET.exprs),
+                           "gene_id"=all.MET.genes.id))
+gene.frame$Branch <- "Shared"
+gene.frame$Branch[gene.frame$symbol %in% setdiff(part1.right.brownMET, part2.left.brownMET)] <- "Partition 1"
+gene.frame$Branch[gene.frame$symbol %in% partt2.spec] <- "Partition 2"
+gene.frame$Branch <- factor(gene.frame$Branch,
+                            levels=c("Shared", "Partition 1", "Partition 2"),
+                            labels=c("Shared", "Partition 1", "Partition 2"))
+
+branch.frame <- as.data.frame(gene.frame[, c("Branch")])
+rownames(branch.frame) <- rownames(MET.exprs)
+colnames(branch.frame) <- "Branch"
+
+# annotate cells by DPT and branch
+dpt.frame <- as.data.frame(t(do.call(rbind.data.frame,
+                                     list(c(dc.merge[colnames(right.MET.exprs),]$DPT1[order(dc.merge[colnames(right.MET.exprs),]$DPT1,
+                                                                                            decreasing=TRUE)],
+                                            dc.merge[colnames(part2.MET.exprs),]$DPT1[order(dc.merge[colnames(part2.MET.exprs),]$DPT1,
+                                                                                            decreasing=TRUE)])))))
+colnames(dpt.frame) <- "DPT"
+rownames(dpt.frame) <- colnames(MET.exprs)
+dpt.frame$pBranch <- ""
+dpt.frame$pBranch[rownames(dpt.frame) %in% paste("Part1", part1.branch.cells, sep=".")] <- "Partition 1"
+dpt.frame$pBranch[rownames(dpt.frame) %in% paste("Part2", part2.left.branch.cells, sep=".")] <- "Partition 2"
+dpt.frame$pBranch <- factor(dpt.frame$pBranch,
+                            levels=c("Partition 1", "Partition 2"),
+                            labels=c("Partition 1", "Partition 2"))
+
+dc.cols <- colorRampPalette(c("#FAFF60", "#8615B0"))(dim(dpt.frame)[1])
+names(dc.cols) <- dpt.frame$DPT
+
+branch.cols <- alpha(c("darkolivegreen", "purple", "darkorange"), 0.85)
+names(branch.cols) <- levels(branch.frame$Branch)
+
+ptime.cols <- c("firebrick1", "goldenrod1")
+names(ptime.cols) <- unique(dpt.frame$pBranch)
+
+column.gaps <- cumsum(table(dpt.frame$pBranch))
+hm.col <- rev(colorRampPalette(brewer.pal(9, "RdGy"))(100))
+
+#order rows by gene group
+pheatmap(MET.exprs[rownames(branch.frame)[order(branch.frame$Branch)], ],
+         annotation_col=dpt.frame, 
+         annotation_colors=list("DPT"=dc.cols,
+                                "pBranch"=ptime.cols),
+         color=hm.col,
+         #annotation_row=branch.frame,
+         gaps_col=column.gaps, cex=1,
+         show_colnames=FALSE, show_rownames=TRUE,
+         fontsize_row=14,
+         cluster_cols=FALSE, cluster_rows=TRUE,
+         filename="~/Dropbox/Reports_Adipose/Adipogenesis2017/Figures/METgenes_ALL-heatmap.png",
+         height=8.75, width=11.75, res=300)
+```
+
+
+### Adipogenesis gene expression
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.height=8.75, fig.width=11.75}
+# create a heatmap of adipogenesis gene expression
+# restrict heatmap to genes with |lfChange| > 2
+adipo.ensembl <- unique(hallmark.merge$ensembl_gene_id[hallmark.merge$GeneSet == "HALLMARK_ADIPOGENESIS"])
+adipo.symbols <- gene_symbol[gene_symbol$ensembl_gene_id %in% adipo.ensembl, ]$external_gene_name
+
+# add in Pparg and Cebpa
+part1.blue.adipo <- c(intersect(part1.de.genes[part1.de.genes$Sig == 1, ]$gene_id,
+                                adipo.ensembl), "ENSMUSG00000000440", "ENSMUSG00000034957")
+part2.brown.adipo <- c(intersect(part2.de.genes[part1.de.genes$Sig == 1, ]$gene_id,
+                                 adipo.ensembl), "ENSMUSG00000000440", "ENSMUSG00000034957")
+
+all.adipo.genes.exprs <- unique(c(part1.blue.adipo, part2.brown.adipo))
+all.adipo.genes.id <- gene_symbol[all.adipo.genes.exprs, ]$external_gene_name
+
+part1.adipo.exprs <- adipose.nz[all.adipo.genes.exprs, intersect(colnames(adipose.nz), part1.branch.cells)]
+part1.adipo.exprs <- part1.adipo.exprs[, order(dc.merge[colnames(part1.adipo.exprs), ]$DPT1, decreasing=TRUE)]
+
+part2.adipo.exprs <-  adipose.nz[all.adipo.genes.exprs, intersect(colnames(adipose.nz), part2.left.branch.cells)]
+part2.adipo.exprs <- part2.adipo.exprs[, order(dc.merge[colnames(part2.adipo.exprs), ]$DPT1, decreasing=TRUE)]
+
+# order each by their respective pseudotimes 
+# some of the cluster 2 cells will be duplicated for the left and right branches
+adipo.exprs <- do.call(cbind.data.frame,
+                     list("Part1"=part1.adipo.exprs,
+                          "Part2"=part2.adipo.exprs))
+rownames(adipo.exprs) <- all.adipo.genes.id
+
+# assign genes to which branch they are specifically DE in
+part1.right.brownadipo <- rownames(part1.adipo.exprs)
+part2.left.brownadipo <- rownames(part2.adipo.exprs)
+
+right.spec <- setdiff(part1.blue.adipo, unique(part2.brown.adipo))
+partt2.spec <- setdiff(part2.brown.adipo, unique(part1.blue.adipo))
+
+gene.frame <- do.call(cbind.data.frame,
+                      list("symbol"=rownames(adipo.exprs),
+                           "gene_id"=all.adipo.genes.exprs))
+
+gene.frame$Branch <- "Shared"
+gene.frame$Branch[gene.frame$symbol %in% right.spec] <- "Partition 1"
+gene.frame$Branch[gene.frame$symbol %in% partt2.spec] <- "Partition 2"
+gene.frame$Branch <- factor(gene.frame$Branch,
+                            levels=c("Shared", "Partition 1", "Partition 2"),
+                            labels=c("Shared", "Partition 1", "Partition 2"))
+
+branch.frame <- as.data.frame(gene.frame[, c("Branch")])
+rownames(branch.frame) <- rownames(adipo.exprs)
+colnames(branch.frame) <- "Branch"
+
+# annotate cells by DPT and branch
+dpt.frame <- as.data.frame(t(do.call(rbind.data.frame,
+                                     list(c(dc.merge[colnames(part1.adipo.exprs),]$DPT1[order(dc.merge[colnames(part1.adipo.exprs),]$DPT1,
+                                                                                            decreasing=TRUE)],
+                                            dc.merge[colnames(part2.adipo.exprs),]$DPT1[order(dc.merge[colnames(part2.adipo.exprs),]$DPT1,
+                                                                                            decreasing=TRUE)])))))
+colnames(dpt.frame) <- "DPT"
+rownames(dpt.frame) <- colnames(adipo.exprs)
+dpt.frame$pBranch <- ""
+dpt.frame$pBranch[rownames(dpt.frame) %in% paste("Part1", part1.branch.cells, sep=".")] <- "Partition 1"
+dpt.frame$pBranch[rownames(dpt.frame) %in% paste("Part2", part2.left.branch.cells, sep=".")] <- "Partition 2"
+dpt.frame$pBranch <- factor(dpt.frame$pBranch,
+                            levels=c("Partition 1", "Partition 2"),
+                            labels=c("Partition 1", "Partition 2"))
+
+dc.cols <- colorRampPalette(c("#FAFF60", "#8615B0"))(dim(dpt.frame)[1])
+names(dc.cols) <- dpt.frame$DPT
+
+branch.cols <- alpha(c("darkolivegreen", "purple", "darkorange"), 0.85)
+names(branch.cols) <- levels(branch.frame$Branch)
+
+ptime.cols <- c("firebrick1", "goldenrod1")
+names(ptime.cols) <- unique(dpt.frame$pBranch)
+
+column.gaps <- cumsum(table(dpt.frame$pBranch))
+hm.col <- colorRampPalette(brewer.pal(9, "Purples"))(100)
+
+#order rows by gene group
+pheatmap(adipo.exprs[rownames(branch.frame)[order(branch.frame$Branch)], ],
+         annotation_col=dpt.frame, 
+         annotation_colors=list("DPT"=dc.cols,
+                                "pBranch"=ptime.cols),
+         color=hm.col,
+         gaps_col=column.gaps, cex=1,
+         show_colnames=FALSE, show_rownames=TRUE,
+         fontsize_row=14,
+         cluster_cols=FALSE, cluster_rows=TRUE,
+         filename="~/Dropbox/Reports_Adipose/Adipogenesis2017/Figures/Adipogenes_ALL-heatmap.png",
+         height=8.75, width=11.75, res=300)
+```
+
+
+## Complement component expression over pseudotime
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+rownames(gene_symbol) <- gene_symbol$ensembl_gene_id
+complement.genes <- gene_symbol$ensembl_gene_id[gene_symbol$external_gene_name %in% c("C2", "C3", "C4", "C5",
+                                                                                      "C6", "C7", "Cfh", "C1qa", "Cr1",
+                                                                                      "Cfb", "Cfd", "C1s", "Vtn", "Cd55",
+                                                                                      "Pparg", "Fabp4", "Cebpa", "Wt1")]
+complement.exprs <- adipose.nz[rownames(adipose.nz) %in% complement.genes, ]
+complement.trans <- as.data.frame(apply(as.data.frame(t(complement.exprs)),
+                                        2, as.numeric))
+colnames(complement.trans) <- gene_symbol[rownames(complement.exprs), ]$external_gene_name
+complement.trans$Sample <- colnames(complement.exprs)
+complement.merge <- merge(complement.trans, dc.merge, by='Sample')
+```
+
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.height=4.25, fig.width=10.25}
+
+complement.merge$Label <- complement.merge$Kmeans
+complement.merge$Label[complement.merge$Label == 1] <- "Partition 1"
+complement.merge$Label[complement.merge$Label == 2] <- "Partition 2"
+
+c7.by.ptime <- ggplot(complement.merge, aes(x=DC1, y=DC2, fill=C7)) +
+  geom_point(size=3, shape=21) + theme_minimal() +
+  scale_fill_gradient(low="#F4F6AC", high="#A40000") +
+  labs(x="Diffusion Component 1", y="Diffusion Component 2") +
+  theme(panel.grid=element_blank(),
+        strip.text=element_text(size=17, colour="black"),
+        axis.text=element_text(size=14, colour="black"),
+        axis.title=element_text(size=17, colour="black", face="bold"),
+        legend.title=element_text(size=14, colour="black", face="bold"),
+        legend.text=element_text(size=14)) +
+  guides(fill=guide_colorbar(override.aes=aes(size=4))) +
+  facet_wrap(~Label, scales="free")
+
+ggsave(c7.by.ptime,
+       filename="~/Dropbox/Reports_Adipose/Adipogenesis2017/Figures/C7_by_pseudotime-scatter.png",
+       height=4.25, width=10.25, dpi=300)
+
+c7.by.ptime
+```
+
+Plot the changes in complement component expression over pseudotime.  Show left and right branches separately.
+
+#### Partition 1
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.height=4.75, fig.width=9.75}
+complement.melt <- melt(complement.trans, id.vars = c("Sample"))
+comp.melt.merge <- merge(complement.melt, dc.merge, by=c("Sample"))
+
+comp.melt.merge$variable <- factor(comp.melt.merge$variable,
+                                   levels=c("C1s", "C2", "C3", "Cfb", "Cfh", "C7", "Vtn", "Cd55",
+                                            "Fabp4", "Pparg", "Cebpa", "Wt1"),
+                                   labels=c("C1s", "C2", "C3", "Cfb", "Cfh", "C7", "Vtn", "Cd55",
+                                            "Fabp4", "Pparg", "Cebpa", "Wt1"))
+
+# only plot the left-hand pseudotime cells
+part1.comp.by <- ggplot(comp.melt.merge[comp.melt.merge$Sample %in% part1.branch.cells, ],
+       aes(x=DPT1, y=value, fill=variable, group=variable)) +
+  geom_point(shape=21) + theme_minimal() +
+  facet_wrap(~variable, ncol=4) +
+  scale_fill_Publication() +
+  stat_smooth(span=0.5) +
+  labs(x="Diffusion Pseudotime", y=expression(paste("Log"[2], " Normalized Expression"))) +
+  guides(group=FALSE, colour=FALSE, shape=FALSE, fill=FALSE)  +
+  theme(panel.grid.minor = element_blank(),
+        axis.text=element_text(size=14, colour="black"),
+        axis.title=element_text(size=17, colour="black"),
+        strip.text=element_text(size=17, colour="black"))
+
+ggsave(part1.comp.by,
+       filename="~/Dropbox/Reports_Adipose/Adipogenesis2017/Figures/Complement_by_Kmeans1Pseudotime-scatter.png",
+       height=5.25, width=10.75, dpi=300)
+
+part1.comp.by
+```
+
+
+#### Partition 2 branch
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.height=4.75, fig.width=9.75}
+complement.melt <- melt(complement.trans, id.vars = c("Sample"))
+comp.melt.merge <- merge(complement.melt, dc.merge, by=c("Sample"))
+
+comp.melt.merge$variable <- factor(comp.melt.merge$variable,
+                                   levels=c("C1s", "C2", "C3", "Cfb", "Cfh", "C7", "Vtn", "Cd55",
+                                            "Fabp4", "Pparg", "Cebpa", "Wt1"),
+                                   labels=c("C1s", "C2", "C3", "Cfb", "Cfh", "C7", "Vtn", "Cd55",
+                                            "Fabp4", "Pparg", "Cebpa", "Wt1"))
+
+# only plot the left-hand pseudotime cells
+part2.comp.by.lptime <- ggplot(comp.melt.merge[comp.melt.merge$Sample %in% part2.left.branch.cells, ],
+       aes(x=DPT1, y=value, fill=variable, group=variable)) +
+  geom_point(shape=21) + theme_minimal() +
+  facet_wrap(~variable, ncol=4) +
+  scale_fill_Publication() +
+  stat_smooth(span=0.5) +
+  labs(x="Diffusion Pseudotime", y=expression(paste("Log"[2], " Normalized Expression"))) +
+  guides(group=FALSE, colour=FALSE, shape=FALSE, fill=FALSE)  +
+  theme(panel.grid.minor = element_blank(),
+        axis.text=element_text(size=14, colour="black"),
+        axis.title=element_text(size=17, colour="black"),
+        strip.text=element_text(size=17, colour="black"))
+
+ggsave(part2.comp.by.lptime,
+       filename="~/Dropbox/Reports_Adipose/Adipogenesis2017/Figures/Complement_by_LeftPseudotime-Kmeans2-scatter.png",
+       height=5.25, width=10.75, dpi=300)
+
+part2.comp.by.lptime
+```
+
+#### All cells
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.height=4.75, fig.width=9.75}
+# only plot the left-hand pseudotime cells
+comp.by.ptime <- ggplot(comp.melt.merge,
+       aes(x=DPT1, y=value, fill=variable, group=variable)) +
+  geom_point(shape=21) + theme_minimal() +
+  facet_wrap(~variable, ncol=4) +
+  scale_fill_Publication() +
+  stat_smooth(span=0.5) +
+  labs(x="Diffusion Pseudotime", y=expression(paste("Log"[2], " Normalized Expression"))) +
+  guides(group=FALSE, colour=FALSE, shape=FALSE, fill=FALSE)  +
+  theme(panel.grid.minor = element_blank(),
+        axis.text=element_text(size=14, colour="black"),
+        axis.title=element_text(size=17, colour="black"),
+        strip.text=element_text(size=17, colour="black"))
+
+ggsave(comp.by.ptime,
+       filename="~/Dropbox/Reports_Adipose/Adipogenesis2017/Figures/Complement_by_pseudotime-scatter.png",
+       height=5.25, width=10.75, dpi=300)
+
+comp.by.ptime
+```
+
+Are there any timing differences in the expression of these different components along pseudotime?
+
+### Partition 1 branch
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+rownames(complement.trans) <- complement.trans$Sample
+# split by branch
+part1.right.complement.trans <- complement.trans[complement.trans$Sample %in% part1.branch.cells, ]
+part1.right.dc <- dc.merge[dc.merge$Sample %in% part1.branch.cells, ]
+part1.right.ptime <- part1.right.dc$Sample[order(part1.right.dc$DPT1)]
+
+# order cells by pseudotime
+#part1.right.comp.t_cor <- temp_cor(t(part1.right.complement.trans[part1.right.ptime, -ncol(part1.right.complement.trans)]))
+part1.right.comp.t_cor <- cor(part1.right.complement.trans[part1.right.ptime, -ncol(part1.right.complement.trans)], method='pearson')
+pheatmap(part1.right.comp.t_cor, color=hm.cols, breaks=seq(-1, 1, by=0.02),
+         cluster_cols=FALSE, cluster_rows=FALSE,
+         filename="~/Dropbox/Reports_Adipose/Adipogenesis2017/Figures/Complement_PearsonCor-Kmeans1Pseudotime-heatmap.png",
+         height=3.75, width=4.25, res=300)
+```
+
+These are the temporal correlations across the ordered cells on the right partition 1 branch.  What about the cross correlation?
+I might need to use a windowed approach to smooth out the large numbers of 0's.
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+part1.right.comp.ccf.list <- list()
+comp.genes <- colnames(part1.right.complement.trans[part1.right.ptime, -ncol(part1.right.complement.trans)])
+
+# set the maximum lag to 75% of all cells
+lag.max <- dim(part1.right.complement.trans)[1] * 0.95
+
+for(i in seq_along(comp.genes)){
+  i.list <- list()
+  for(j in seq_along(comp.genes)){
+    xcor <- ccf(x=as.numeric(part1.right.complement.trans[, comp.genes[i]]),
+                y=as.numeric(part1.right.complement.trans[, comp.genes[j]]),
+                plot=FALSE,
+                lag.max=lag.max)
+    i.list[[comp.genes[j]]] <- xcor
+  }
+  part1.right.comp.ccf.list[[comp.genes[i]]] <- i.list
+}
+
+part1.right.comp.lag.list <- list()
+for(i in 1:length(comp.genes)){
+  i.lags <- list()
+  for(j in 1:length(comp.genes)){
+    ccf.obj <- part1.right.comp.ccf.list[[comp.genes[i]]][[comp.genes[j]]]
+    lag <- ccf.obj$lag
+    max.cor <- max(abs(ccf.obj$acf))
+    max.idx <- which(abs(ccf.obj$acf) == max.cor)
+    max.lag <- lag[max.idx]
+    i.lags[[comp.genes[j]]] <- max.lag
+  }
+  part1.right.comp.lag.list[[comp.genes[i]]] <- i.lags
+}
+
+part1.right.comp.lag.df <- data.frame(lapply(part1.right.comp.lag.list, unlist))
+# show only the upper triangle
+part1.right.plot.hm <- as.matrix(part1.right.comp.lag.df/max(abs(part1.right.comp.lag.df)))
+part1.right.plot.hm[lower.tri(part1.right.plot.hm, diag=TRUE)] <- NA
+
+colnames(part1.right.plot.hm) <- colnames(part1.right.comp.lag.df)
+rownames(part1.right.plot.hm) <- rownames(part1.right.comp.lag.df)
+hm.cols <- rev(colorRampPalette(brewer.pal(19, "RdGy"))(100))
+
+pheatmap(part1.right.plot.hm,
+         cluster_rows=FALSE, cluster_cols=FALSE,
+         color=hm.cols, breaks=seq(-1, 1, by=0.02),
+         filename="~/Dropbox/Reports_Adipose/Adipogenesis2017/Figures/Complement_Xcor_lag-RightPseudotime-heatmap.png",
+         height=3.75, width=4.25, res=300)
+```
+
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+pheatmap(part1.right.plot.hm,
+         cluster_rows=FALSE, cluster_cols=FALSE,
+         color=hm.cols, breaks=seq(-1, 1, by=0.02))
+```
+
+
+### Partition 2 branch
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+# split by branch
+part2.left.complement.trans <- complement.trans[complement.trans$Sample %in% part2.left.branch.cells, ]
+part2.left.dc <- dc.merge[dc.merge$Sample %in% part2.left.branch.cells, ]
+part2.left.ptime <- part2.left.dc$Sample[order(part2.left.dc$DPT1)]
+
+# order cells by pseudotime
+#part2.left.comp.t_cor <- temp_cor(t(part2.left.complement.trans[part2.left.ptime, -ncol(part2.left.complement.trans)]))
+part2.left.comp.t_cor <- cor(part2.left.complement.trans[part2.left.ptime, -ncol(part2.left.complement.trans)], method='pearson')
+pheatmap(part2.left.comp.t_cor, color=hm.cols, breaks=seq(-1, 1, by=0.02),
+         cluster_cols=FALSE, cluster_rows=FALSE,
+         filename="~/Dropbox/Reports_Adipose/Adipogenesis2017/Figures/Complement_PearsonCor-Part2Pseudotime-heatmap.png",
+         height=3.75, width=4.25, res=300)
+```
+
+These are the temporal correlations across the ordered cells on the left partition 1 branch.  What about the cross correlation?
+I might need to use a windowed approach to smooth out the large numbers of 0's.
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+part2.left.comp.ccf.list <- list()
+comp.genes <- colnames(part2.left.complement.trans[part2.left.ptime, -ncol(part2.left.complement.trans)])
+
+# set the maximum lag to 75% of all cells
+lag.max <- dim(part2.left.complement.trans)[1] * 0.95
+
+for(i in seq_along(comp.genes)){
+  i.list <- list()
+  for(j in seq_along(comp.genes)){
+    xcor <- ccf(x=as.numeric(part2.left.complement.trans[, comp.genes[i]]),
+                y=as.numeric(part2.left.complement.trans[, comp.genes[j]]),
+                plot=FALSE,
+                lag.max=lag.max)
+    i.list[[comp.genes[j]]] <- xcor
+  }
+  part2.left.comp.ccf.list[[comp.genes[i]]] <- i.list
+}
+
+part2.left.comp.lag.list <- list()
+for(i in 1:length(comp.genes)){
+  i.lags <- list()
+  for(j in 1:length(comp.genes)){
+    ccf.obj <- part2.left.comp.ccf.list[[comp.genes[i]]][[comp.genes[j]]]
+    lag <- ccf.obj$lag
+    max.cor <- max(abs(ccf.obj$acf))
+    max.idx <- which(abs(ccf.obj$acf) == max.cor)
+    max.lag <- lag[max.idx]
+    i.lags[[comp.genes[j]]] <- max.lag
+  }
+  part2.left.comp.lag.list[[comp.genes[i]]] <- i.lags
+}
+
+part2.left.comp.lag.df <- data.frame(lapply(part2.left.comp.lag.list, unlist))
+# show only the upper triangle
+part2.left.plot.hm <- as.matrix(part2.left.comp.lag.df/max(abs(part2.left.comp.lag.df)))
+part2.left.plot.hm[lower.tri(part2.left.plot.hm, diag=TRUE)] <- NA
+
+colnames(part2.left.plot.hm) <- colnames(part2.left.comp.lag.df)
+rownames(part2.left.plot.hm) <- rownames(part2.left.comp.lag.df)
+
+pheatmap(part2.left.plot.hm,
+         cluster_rows=FALSE, cluster_cols=FALSE,
+         color=hm.cols, breaks=seq(-1, 1, by=0.02),
+         filename="~/Dropbox/Reports_Adipose/Adipogenesis2017/Figures/Complement_Xcor_lag-LeftPseudotime-Kmeans2-heatmap.png",
+         height=3.75, width=4.25, res=300)
+```
+
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+pheatmap(part2.left.plot.hm,
+         cluster_rows=FALSE, cluster_cols=FALSE,
+         color=hm.cols, breaks=seq(-1, 1, by=0.02))
+```
+
+To compare betweena pair of correlations, one can use Fisher's Z-transformation, then test whether the difference in Z-values is statistically 
+significant given a standard normal distribution.  This test also adjusts for the different sample sizes.  I don't know if it is strictly correct 
+to compare the standardised maximum lag values or not?
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+cor.diff.test = function(r1, r2, n1, n2, alternative = c("two.sided", "less", "greater")) {
+  # https://stackoverflow.com/questions/14519006/significance-test-on-the-difference-of-two-correlation-coefficient
+  Z1 = 0.5 * log( (1+r1)/(1-r1) )
+  Z2 = 0.5 * log( (1+r2)/(1-r2) )
+
+  diff = Z1 - Z2
+  SEdiff = sqrt( 1 / (n1 - 3) + 1 / (n2 - 3))
+  diff.Z = diff / SEdiff
+  
+  # return the absolute difference in correlation for reporting only
+  diff.cor <- r1 - r2
+
+  if (alternative == "less") {
+    p.return <- pnorm(diff.Z, lower.tail=F)
+    return(c(p.return, diff.cor))
+  } else if (alternative == "greater") {
+    p.return <- pnorm(-diff.Z, lower.tail=F)
+    return(c(p.return, diff.cor))
+  } else if (alternative == "two.sided") {
+    p.return <- 2 * pnorm(abs(diff.Z), lower.tail=F)
+    return(c(p.return, diff.cor))
+  } else {
+    warning(paste("Invalid alterantive", alternative), domain=NA)
+    return(NA)
+  }
+}
+
+### partition 1 right branch
+part1.right.comp.t_cor[lower.tri(part1.right.comp.t_cor, diag=TRUE)] <- NA
+part1.right.cor <- as.data.frame(part1.right.comp.t_cor)
+part1.right.cor$gene <- rownames(part1.right.comp.t_cor)
+part1.right.melt <- melt(part1.right.cor, id.var='gene')
+part1.right.melt <- part1.right.melt[!is.na(part1.right.melt$value), ]
+colnames(part1.right.melt) <- c("Gene1", "Gene2", "Corr")
+part1.right.melt$Gene2 <- as.character(part1.right.melt$Gene2)
+# remove self-self
+part1.right.melt <- part1.right.melt[part1.right.melt$Gene1 != part1.right.melt$Gene2, ]
+part1.right.melt$Branch <- "Part1"
+part1.right.n <- length(part1.branch.cells)
+
+
+### partition 2 branch
+part2.left.comp.t_cor[lower.tri(part2.left.comp.t_cor, diag=TRUE)] <- NA
+part2.left.cor <- as.data.frame(part2.left.comp.t_cor)
+part2.left.cor$gene <- rownames(part2.left.comp.t_cor)
+part2.left.melt <- melt(part2.left.cor, id.var='gene')
+part2.left.melt <- part2.left.melt[!is.na(part2.left.melt$value), ]
+colnames(part2.left.melt) <- c("Gene1", "Gene2", "Corr")
+part2.left.melt$Gene2 <- as.character(part2.left.melt$Gene2)
+# remove self-self
+part2.left.melt <- part2.left.melt[part2.left.melt$Gene1 != part2.left.melt$Gene2, ]
+part2.left.melt$Branch <- "Part2"
+part2.left.n <- length(part2.left.branch.cells)
+
+all.melt.cor <- do.call(rbind.data.frame,
+                        list("Part1"=part1.right.melt,
+                             "Part2"=part2.left.melt))
+
+all.n.cor <- list("Part1"=part1.right.n,
+                  "Part2"=part2.left.n)
+
+## compare each pair of branches
+# do this for each pair of genes
+branch.cors.compare <- list()
+branches <- c("Part1", "Part2")
+compares <- c("Part1 vs. Part2")
+
+for(i in seq_along(compares)){
+  comp <- unlist(strsplit(compares[i], split=" vs. ", fixed=T))
+  p1 <- all.melt.cor[all.melt.cor$Branch == comp[1], ]
+  p2 <- all.melt.cor[all.melt.cor$Branch == comp[2], ]
+  l1 <- all.n.cor[[comp[1]]]
+  l2 <- all.n.cor[[comp[2]]]
+  
+  gene.cors <- list()
+  for(x in seq_along(seq(1, dim(p1)[1]))){
+       g1 <- p1$Gene1[x]
+       g2 <- p1$Gene2[x]
+       r1 <- p1$Corr[p1$Gene1 == g1 & p1$Gene2 == g2]
+       r2 <- p2$Corr[p2$Gene1 == g1 & p2$Gene2 == g2]
+       cor.p <- cor.diff.test(r1=r1, n1=l1, r2=r2, n2=l2, alternative="two.sided")
+       gene.cors[[paste(g1, g2, sep=".")]] <- cor.p
+  }
+  gene.cors.df <- do.call(rbind.data.frame,
+                          gene.cors)
+  gene.cors.df$Branches <- compares[[i]]
+  gene.cors.df$Compare <- names(gene.cors)
+  colnames(gene.cors.df) <- c("Pval", "Diff", "Branches", "Compare")
+  
+  branch.cors.compare[[compares[i]]] <- gene.cors.df
+}
+
+
+all.cor.test <- do.call(rbind.data.frame,
+                          branch.cors.compare)
+all.cor.test$Padjust <- p.adjust(all.cor.test$Pval)
+
+# FDR 5%
+all.cor.test$Sig <- as.factor(as.numeric(all.cor.test$Padjust <= 0.05))
+```
+
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.height=4.25, fig.width=4.75}
+gene.labels <- all.cor.test$Compare
+gene.labels[all.cor.test$Sig == 0] <- ""
+gene.labels <- gsub(gene.labels, pattern="\\.", replacement=" vs. ")
+
+comp.corr.volcano <- ggplot(all.cor.test, 
+                            aes(x=Diff, y=-log10(Pval), fill=Sig, shape=Branches)) +
+  scale_fill_manual(values=c("black", "red")) +
+  geom_point(size=3, shape=21) +
+  scale_y_continuous(limits=c(0, 5)) +
+  scale_x_continuous(limits=c(-0.3, 0.3)) +
+  labs(x=expression(paste(Delta, " Correlation")), y=expression(paste("-log"[10], " p-value"))) +
+  theme_mike() +
+  theme(axis.title=element_text(face="bold", size=15, colour="black"),
+        legend.position="right") +
+  guides(fill=FALSE) +
+  geom_label_repel(aes(label=gene.labels),
+                   colour='black',
+                   fill="white",
+                   nudge_x=-0.1,
+                   nudge_y=0.1,
+                   size=4)
+
+ggsave(comp.corr.volcano, 
+       filename="~/Dropbox/Reports_Adipose/Adipogenesis2017/Figures/Complement-correlation-volcano.png",
+       height=4.25, width=4.75, dpi=300)
+
+comp.corr.volcano
+```
+
+There are very few correlations that are genuinely different between the ranches after multiple testing correction.  The main differences seem 
+to relate to Complement factor H (_Cfh_) and component 7 (_C7_).  There's also a differences between _Vtn_ and _Fabp4_ between the left and right 
+branches.  In fact, 3/4 of these "signficant" differences are between the left and right branches, rather than with partition 2.
+
+## Plot qPCR results from C7 blockade experiment
+
+Read in the C7 blockade experiment results.  These are qPCR of two adipogenesis markers; _Pparg_ and _Ap2_.  These two markers lag 
+behind the various complement genes across the pseudotime trajectory.
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.height=3.25, fig.width=7.25}
+c7.block <- read.table("~/Dropbox/Reports_Adipose/C7_blockade_results.txt",
+                       sep="\t", h=TRUE, stringsAsFactors=FALSE, row.names = NULL)
+
+# some antibody concentrations don't contain any info
+c7.block <- c7.block[c7.block$AbConc %in% c(200, 500), ]
+c7.block$AbConc <- as.factor(c7.block$AbConc)
+
+# use the same gene symbols
+c7.block$Gene <- factor(c7.block$Gene,
+                        labels=c("Fabp4", "Pparg"),
+                        levels=c("AP2", "PPARG"))
+
+c7.block.plot <- ggplot(c7.block, aes(x=AbConc, y=Value, fill=Source)) + 
+  geom_hline(aes(yintercept=1), linetype="dashed", colour="darkgrey") +
+  geom_boxplot(alpha=0.2) +
+  geom_jitter(size=6, shape=21, position=position_jitterdodge(jitter.width = 0.1)) +
+  theme_minimal() +
+  scale_fill_manual(values=c("#6F008D", "#3BD43D")) +
+  facet_wrap(~Gene, scales="free_x") +
+  theme(panel.spacing = unit(1.5, "lines"),
+        axis.text=element_text(size=14, colour="black", family="Helvetica"),
+        axis.title=element_text(size=17, colour="black", family="Helvetica"),
+        strip.text=element_text(size=17, colour="black", family="Helvetica", face="italic")) +
+  labs(x="Antibody Concentration", y="IgG Fold Change") +
+  scale_y_continuous(limits=c(0, 2), oob=squish) +
+  scale_x_discrete(labels=c("1:200", "1:500")) +
+  guides(fill=guide_legend(title="Experiment", family="Helvetica"))
+
+ggsave(c7.block.plot,
+       filename="~/Dropbox/Reports_Adipose/Adipogenesis2017/Figures/C7_blockade-qPCR.png",
+       height=3.25, width=7.25, dpi=300)
+
+c7.block.plot
+```
+
+
+How much sharing is there between the different pseudotime gene modules?
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+# which pairs of clusters between branches and partitions are the most similar?
+part1.V.part2 <- list()
+
+part1.clusters <- unique(part1.right.branch.clusters$Cluster)
+part2.clusters <- unique(part2.left.branch.clusters$Cluster)
+
+for(i in seq_along(part1.clusters)){
+  l.clust <- part1.clusters[i]
+  for(j in seq_along(part2.clusters)){
+    r.clust <- part2.clusters[j]
+    i.genes <- part1.right.branch.clusters$gene_id[part1.right.branch.clusters$Cluster == l.clust]
+    j.genes <- part2.left.branch.clusters$gene_id[part2.left.branch.clusters$Cluster == r.clust]
+    overlap <- length(intersect(i.genes, j.genes))
+    total <- length(unique(c(i.genes, j.genes)))
+    
+    prop <- overlap/total
+    part1.V.part2[[paste(l.clust, r.clust, sep=".")]] <- prop
+  }
+}
+
+left.V.right.df <- as.data.frame(matrix(unlist(part1.V.part2), ncol=length(part1.clusters), nrow=length(part2.clusters)))
+colnames(left.V.right.df) <- part1.clusters
+rownames(left.V.right.df) <- part2.clusters
+
+pheatmap(left.V.right.df,
+         cluster_rows=FALSE, cluster_cols=FALSE)
+```
+
+More generally, how much overlap is there between the DE genes sets for the different branches?
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.height=4.75, fig.width=6.75}
+# png("~/Dropbox/Reports_Adipose/Adipogenesis2017/Figures/MET_venndiagram.png",
+#     height=5.75, width=5.75, res=300, units="in")
+part1.de <- part1.de.genes$gene_id[part1.de.genes$Sig == 1]
+part2.de <- part2.de.genes$gene_id[part2.de.genes$Sig == 1]
+
+grid.newpage()
+de.venn <- draw.pairwise.venn(area1=length(part1.de),
+                             area2=length(part2.de),
+                             cross.area=length(intersect(part1.de, part2.de)),
+                             category=c("Partition 1", "Partition 2"),
+                             lwd=rep(1.5, 2), fill=c("purple", "orange"),
+                             col=rep("black", 2), alpha=rep(0.5, 2),
+                             fontface=rep("bold", 3),
+                             cat.fontface=rep("bold", 2), cex=rep(2, 3),
+                             cat.cex=rep(2, 2), cat.pos=c(-10, 10),
+                             cat.dist=rep(0.1, 2),
+                             fontfamily=rep("Helvetica", 3))
+grid.draw(de.venn)
+```
+
+There are 415 genes commonly DE between both trajectories.  What are the biological pathways enriched amongst these genes?
+
+```{r, echo=FALSE, fig.height=6.75, fig.width=12.5}
+gene.tpm <- read.table("~/Dropbox/Thymus/mTEC_1_01.quant", sep="\t",
+                       h=T, stringsAsFactors=F)
+
+int.all <- intersect(part1.de, part2.de)
+all.genes <- part1.de.genes$gene_id
+
+gene.length <- gene.tpm$Length[unique(gene.tpm$Name) %in% unique(all.genes)]
+names(gene.length) <- intersect(unique(gene.tpm$Name) , unique(all.genes))
+
+de.big.vector <- as.integer(unique(all.genes) %in% unique(int.all))
+names(de.big.vector) <- unique(all.genes)
+
+de.big.vector <- de.big.vector[intersect(names(de.big.vector), names(gene.length))]
+
+pwf.all <- nullp(de.big.vector, "mm10", "ensGene", bias.data=gene.length[intersect(names(de.big.vector), names(gene.length))],
+                 plot.fit=FALSE)
+GO.wall.all  <- goseq(pwf.all, genome="mm10", id="ensGene", gene2cat=hallmark.go,
+                           method="Wallenius", use_genes_without_cat=T)
+# GO.wall.all <- goseq(pwf.all, genome="mm10", id="ensGene", test.cats=c("GO:BP"),
+#                       method="Wallenius", use_genes_without_cat=T)
+
+GO.wall.all$padjust <- p.adjust(GO.wall.all$over_represented_pvalue, method="BH")
+GO.wall.all$foldEnrich <- ((GO.wall.all$numDEInCat/length(unique(int.all)))/(GO.wall.all$numInCat/length(gene.length)))
+
+# select on p-value and foldEnrich
+GO.sig.all <- GO.wall.all[(GO.wall.all$padjust <= 0.01), ]
+go_cats.all <- data.frame(GO.sig.all$category, GO.sig.all$foldEnrich)
+
+p.enrich <- ggplot(GO.sig.all,
+                   aes(x=foldEnrich, y=-log10(padjust), colour=-log10(padjust),
+                       size=foldEnrich)) +
+  geom_point() + theme_mike() +
+  scale_colour_gradient(low="#000000", high="#DC143C")
+
+GO.all <- GO.sig.all[order(GO.sig.all$padjust, decreasing=FALSE), ]
+
+p.terms <- ggplot(na.omit(GO.all[1:20, ]),
+                  aes(x=reorder(category, 
+                                foldEnrich),
+           y=foldEnrich,
+           fill=-log10(padjust))) +
+  scale_fill_distiller(palette="Reds", direction=1) +
+  geom_bar(stat='identity') + theme_mike() +
+  scale_x_discrete(labels=function(X) str_wrap(X, width=50)) +
+  coord_flip() + labs(x="Gene Ontology Term", y="Fold Enrichment")
+
+plot_grid(p.enrich, p.terms, ncol=2, rel_widths=c(0.1, 0.9))
+```
+
+And the pathways unique to each?
+
+
+```{r, echo=FALSE, fig.height=6.75, fig.width=12.5}
+part1.spec <- setdiff(part1.de, part2.de)
+all.genes <- part1.de.genes$gene_id
+
+gene.length <- gene.tpm$Length[unique(gene.tpm$Name) %in% unique(all.genes)]
+names(gene.length) <- intersect(unique(gene.tpm$Name) , unique(all.genes))
+
+de.big.vector <- as.integer(unique(all.genes) %in% unique(part1.spec))
+names(de.big.vector) <- unique(all.genes)
+
+de.big.vector <- de.big.vector[intersect(names(de.big.vector), names(gene.length))]
+
+pwf.all <- nullp(de.big.vector, "mm10", "ensGene", bias.data=gene.length[intersect(names(de.big.vector), names(gene.length))],
+                 plot.fit=FALSE)
+GO.wall.all  <- goseq(pwf.all, genome="mm10", id="ensGene", gene2cat=hallmark.go,
+                           method="Wallenius", use_genes_without_cat=T)
+# GO.wall.all <- goseq(pwf.all, genome="mm10", id="ensGene", test.cats=c("GO:BP"),
+#                       method="Wallenius", use_genes_without_cat=T)
+
+GO.wall.all$padjust <- p.adjust(GO.wall.all$over_represented_pvalue, method="BH")
+GO.wall.all$foldEnrich <- ((GO.wall.all$numDEInCat/length(unique(part1.spec)))/(GO.wall.all$numInCat/length(gene.length)))
+
+# select on p-value and foldEnrich
+GO.sig.all <- GO.wall.all[(GO.wall.all$padjust <= 0.01), ]
+go_cats.all <- data.frame(GO.sig.all$category, GO.sig.all$foldEnrich)
+
+p.enrich <- ggplot(GO.sig.all,
+                   aes(x=foldEnrich, y=-log10(padjust), colour=-log10(padjust),
+                       size=foldEnrich)) +
+  geom_point() + theme_mike() +
+  scale_colour_gradient(low="#000000", high="#DC143C")
+
+GO.all <- GO.sig.all[order(GO.sig.all$padjust, decreasing=FALSE), ]
+
+p.terms <- ggplot(na.omit(GO.all[1:20, ]),
+                  aes(x=reorder(category, 
+                                foldEnrich),
+           y=foldEnrich,
+           fill=-log10(padjust))) +
+  scale_fill_distiller(palette="Reds", direction=1) +
+  geom_bar(stat='identity') + theme_mike() +
+  scale_x_discrete(labels=function(X) str_wrap(X, width=50)) +
+  coord_flip() + labs(x="Gene Ontology Term", y="Fold Enrichment")
+
+plot_grid(p.enrich, p.terms, ncol=2, rel_widths=c(0.1, 0.9))
+```
+
+
+
+```{r, echo=FALSE, fig.height=6.75, fig.width=12.5}
+part2.spec <- setdiff(part2.de, part1.de)
+all.genes <- part1.de.genes$gene_id
+
+gene.length <- gene.tpm$Length[unique(gene.tpm$Name) %in% unique(all.genes)]
+names(gene.length) <- intersect(unique(gene.tpm$Name) , unique(all.genes))
+
+de.big.vector <- as.integer(unique(all.genes) %in% unique(part2.spec))
+names(de.big.vector) <- unique(all.genes)
+
+de.big.vector <- de.big.vector[intersect(names(de.big.vector), names(gene.length))]
+
+pwf.all <- nullp(de.big.vector, "mm10", "ensGene", bias.data=gene.length[intersect(names(de.big.vector), names(gene.length))],
+                 plot.fit=FALSE)
+GO.wall.all  <- goseq(pwf.all, genome="mm10", id="ensGene", gene2cat=hallmark.go,
+                           method="Wallenius", use_genes_without_cat=T)
+# GO.wall.all <- goseq(pwf.all, genome="mm10", id="ensGene", test.cats=c("GO:BP"),
+#                       method="Wallenius", use_genes_without_cat=T)
+
+GO.wall.all$padjust <- p.adjust(GO.wall.all$over_represented_pvalue, method="BH")
+GO.wall.all$foldEnrich <- ((GO.wall.all$numDEInCat/length(unique(part2.spec)))/(GO.wall.all$numInCat/length(gene.length)))
+
+# select on p-value and foldEnrich
+GO.sig.all <- GO.wall.all[(GO.wall.all$padjust <= 0.01), ]
+go_cats.all <- data.frame(GO.sig.all$category, GO.sig.all$foldEnrich)
+
+p.enrich <- ggplot(GO.sig.all,
+                   aes(x=foldEnrich, y=-log10(padjust), colour=-log10(padjust),
+                       size=foldEnrich)) +
+  geom_point() + theme_mike() +
+  scale_colour_gradient(low="#000000", high="#DC143C")
+
+GO.all <- GO.sig.all[order(GO.sig.all$padjust, decreasing=FALSE), ]
+
+p.terms <- ggplot(na.omit(GO.all[1:20, ]),
+                  aes(x=reorder(category, 
+                                foldEnrich),
+           y=foldEnrich,
+           fill=-log10(padjust))) +
+  scale_fill_distiller(palette="Reds", direction=1) +
+  geom_bar(stat='identity') + theme_mike() +
+  scale_x_discrete(labels=function(X) str_wrap(X, width=50)) +
+  coord_flip() + labs(x="Gene Ontology Term", y="Fold Enrichment")
+
+plot_grid(p.enrich, p.terms, ncol=2, rel_widths=c(0.1, 0.9))
+```
+
+What about testing the differences in average expression between partitions, conditioned on the pseudotime?  Would that work?
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+set.seed(24021982)
+# remove the mult-cell controls and turquoise cells 
+multi.cell <- meta.merge$Sample[meta.merge$SampleType == "Multi-cell"]
+# adipose.dm <- DiffusionMap(t(adipose.hvg[, !colnames(adipose.hvg) %in% multi.cell]), n_eigs=3, k=10,
+#                            distance='cosine', sigma='local')
+adipose.dm <- DiffusionMap(t(adipose.pcs[1:10, !colnames(adipose.hvg) %in% multi.cell]),
+                           n_eigs=5, k=13, distance='cosine')
+adipose.dpt <- DPT(adipose.dm)
+adipose.dc <- do.call(cbind.data.frame,
+                      list("Orig.DC1"=adipose.dpt$DC1,
+                           "Orig.DC2"=adipose.dpt$DC2,
+                           "Orig.DC3"=adipose.dpt$DC3,
+                           "Orig.DPT1"=adipose.dpt$DPT1,
+                           "Orig.DPT2"=adipose.dpt$DPT2,
+                           "Orig.DPT3"=adipose.dpt$DPT3))
+rownames(adipose.dc) <- colnames(adipose.pcs[, !colnames(adipose.hvg) %in% multi.cell])
+adipose.dc$Sample <- colnames(adipose.hvg)[!colnames(adipose.hvg) %in% multi.cell]
+
+extra.dc.merge <- merge(dc.merge, adipose.dc, by='Sample')
+extra.dc.merge$Kmeans <- as.factor(extra.dc.merge$Kmeans)
+```
+
+Test it with an interaction term as well.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+# the cells are separated along DC2, ergo this should be the test
+# I need to re-infer the original DC2 though
+extra.dc.merge$Kmean.interact <- as.numeric(extra.dc.merge$Kmeans) * extra.dc.merge$DPT1
+
+partition.design.mat <- model.matrix(~ 0 + Kmeans + DPT1 + Kmean.interact + Plate, data=extra.dc.merge)
+
+# fit a linear model
+partition.fit <- lmFit(adipose.nz,
+                       partition.design.mat)
+
+partition.contrast.mat <-  makeContrasts(Kmeans2-Kmeans1,
+                                         levels=partition.design.mat)
+
+partition.fit <- contrasts.fit(partition.fit, contrasts=partition.contrast.mat)
+partition.fit <- eBayes(partition.fit)
+partition.sum.res <- summary(decideTests(partition.fit))
+
+partition.de.res <- topTable(partition.fit, coef=1, n=Inf, sort="p", p=1.0)
+partition.de.res$Sig <- 0
+partition.de.res$Sig[partition.de.res$adj.P.Val <= 0.01] <- 1
+partition.de.res$Sig <- as.factor(partition.de.res$Sig)
+
+partition.de.res$Diff <- 0
+partition.de.res$Diff[partition.de.res$logFC < 0 & partition.de.res$Sig == 1] <- -1
+partition.de.res$Diff[partition.de.res$logFC > 0 & partition.de.res$Sig == 1] <- 1
+
+partition.de.res$gene_id <- rownames(partition.de.res)
+partition.de.merge <- merge(partition.de.res, gene_symbol,
+                            by.x='gene_id', by.y='ensembl_gene_id', all.x=TRUE)
+
+partition.gene.top <- partition.de.merge$external_gene_name
+partition.gene.top[partition.de.merge$Sig == 0] <- ""
+
+# plot the top 6 and bottom 6 gene symbols
+top6 <- partition.de.merge$external_gene_name[order(partition.de.merge$logFC, decreasing=TRUE)][1:6]
+bottom6 <- partition.de.merge$external_gene_name[order(partition.de.merge$logFC, decreasing=FALSE)][1:6]
+partition.gene.top[!partition.gene.top %in% c(top6, bottom6)] <- ""
+
+partition.gene.top[partition.de.merge$logFC > -2 & partition.de.merge$logFC < 5] <- ""
+partition.gene.top[is.na(partition.gene.top)] <- ""
+
+write.table(partition.de.merge,
+            file="~/Dropbox/Adipose/Adipose-DEgenes-Kmeans1V2-ALL.tsv",
+            sep="\t", quote=F)
+
+partition.ma <- ggplot(partition.de.merge, aes(x=AveExpr, y=logFC, colour=Sig)) +
+  geom_point(size=1, alpha=0.8) + theme_mike() +
+  scale_colour_manual(values=c("#A3A3A3", "#FF0000")) +
+  labs(x=expression(paste("Mean log"[2], " Expression")),
+       y=expression(paste("log"[2], " Fold Change"))) +
+  guides('colour'=FALSE) +
+  ylim(c(-10, 10)) +
+  geom_label_repel(aes(label=partition.gene.top),
+                  colour='black',
+                  nudge_x=0.01,
+                  nudge_y=0.01,
+                  size=3)
+
+ggsave(partition.ma,
+       filename="~/Dropbox/Reports_Adipose/Adipogenesis2017/Figures/ALL-Kmeans1Vs2-MAplot.png",
+       height=4.25, width=6.75, dpi=300)
+
+partition.ma
+```
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+table(partition.de.merge$Diff)
+```
+
+
+```{r, echo=FALSE, fig.height=6.75, fig.width=12.5}
+part1.de <- partition.de.merge$gene_id[partition.de.merge$Sig == 1 & partition.de.merge$Diff == -1]
+part2.de <- partition.de.merge$gene_id[partition.de.merge$Sig == 1 & partition.de.merge$Diff == 1]
+
+all.genes <- part1.de.genes$gene_id
+
+gene.length <- gene.tpm$Length[unique(gene.tpm$Name) %in% unique(all.genes)]
+names(gene.length) <- intersect(unique(gene.tpm$Name) , unique(all.genes))
+
+de.big.vector <- as.integer(unique(all.genes) %in% unique(part1.de))
+names(de.big.vector) <- unique(all.genes)
+
+de.big.vector <- de.big.vector[intersect(names(de.big.vector), names(gene.length))]
+
+pwf.all <- nullp(de.big.vector, "mm10", "ensGene", bias.data=gene.length[intersect(names(de.big.vector), names(gene.length))],
+                 plot.fit=FALSE)
+GO.wall.all  <- goseq(pwf.all, genome="mm10", id="ensGene", gene2cat=hallmark.go,
+                           method="Wallenius", use_genes_without_cat=T)
+# GO.wall.all <- goseq(pwf.all, genome="mm10", id="ensGene", test.cats=c("GO:BP"),
+#                       method="Wallenius", use_genes_without_cat=T)
+
+# convert 0 p-values to minimal 64-bit float
+GO.wall.all$over_represented_pvalue[GO.wall.all$over_represented_pvalue == 0] <- .Machine$double.xmin
+
+GO.wall.all$padjust <- p.adjust(GO.wall.all$over_represented_pvalue, method="BH")
+GO.wall.all$foldEnrich <- ((GO.wall.all$numDEInCat/length(unique(part1.de)))/(GO.wall.all$numInCat/length(gene.length)))
+
+# select on p-value and foldEnrich
+GO.sig.all <- GO.wall.all[(GO.wall.all$padjust <= 0.01), ]
+go_cats.all <- data.frame(GO.sig.all$category, GO.sig.all$foldEnrich)
+
+p.enrich <- ggplot(GO.sig.all,
+                   aes(x=foldEnrich, y=-log10(padjust), colour=-log10(padjust),
+                       size=foldEnrich)) +
+  geom_point() + theme_mike() +
+  scale_colour_gradient(low="#000000", high="#DC143C")
+
+GO.all <- GO.sig.all[order(GO.sig.all$padjust, decreasing=FALSE), ]
+
+pretty.terms <- unlist(lapply(strsplit(GO.all$category, fixed=T, split="_"),
+                              FUN=function(X) str_title_case(gsub(tolower(paste(X[-1], collapse=" ")), perl=TRUE,
+                                                                  pattern="ecm", replacement="ECM"))))
+GO.all$Term <- pretty.terms
+
+p.terms <- ggplot(na.omit(GO.all[1:20, ]),
+                  aes(x=reorder(Term, 
+                                foldEnrich),
+           y=foldEnrich,
+           fill=-log10(padjust))) +
+  scale_fill_distiller(palette="Reds", direction=1) +
+  geom_bar(stat='identity') + theme_mike() +
+  scale_x_discrete(labels=function(X) str_wrap(X, width=35)) +
+  coord_flip() + labs(x="Gene Ontology Term", y="Fold Enrichment")
+
+plot_grid(p.enrich, p.terms, ncol=2, rel_widths=c(0.3, 0.7))
+```
+
+
+```{r, echo=FALSE, fig.height=6.75, fig.width=12.5}
+all.genes <- part1.de.genes$gene_id
+
+gene.length <- gene.tpm$Length[unique(gene.tpm$Name) %in% unique(all.genes)]
+names(gene.length) <- intersect(unique(gene.tpm$Name) , unique(all.genes))
+
+de.big.vector <- as.integer(unique(all.genes) %in% unique(part2.de))
+names(de.big.vector) <- unique(all.genes)
+
+de.big.vector <- de.big.vector[intersect(names(de.big.vector), names(gene.length))]
+
+pwf.all <- nullp(de.big.vector, "mm10", "ensGene", bias.data=gene.length[intersect(names(de.big.vector), names(gene.length))],
+                 plot.fit=FALSE)
+GO.wall.all  <- goseq(pwf.all, genome="mm10", id="ensGene", gene2cat=hallmark.go,
+                           method="Wallenius", use_genes_without_cat=T)
+# GO.wall.all <- goseq(pwf.all, genome="mm10", id="ensGene", test.cats=c("GO:BP"),
+#                       method="Wallenius", use_genes_without_cat=T)
+
+# convert 0 p-values to minimal 64-bit float
+GO.wall.all$over_represented_pvalue[GO.wall.all$over_represented_pvalue == 0] <- .Machine$double.xmin
+
+GO.wall.all$padjust <- p.adjust(GO.wall.all$over_represented_pvalue, method="BH")
+GO.wall.all$foldEnrich <- ((GO.wall.all$numDEInCat/length(unique(part2.de)))/(GO.wall.all$numInCat/length(gene.length)))
+
+# select on p-value and foldEnrich
+GO.sig.all <- GO.wall.all[(GO.wall.all$padjust <= 0.01), ]
+go_cats.all <- data.frame(GO.sig.all$category, GO.sig.all$foldEnrich)
+
+p.enrich <- ggplot(GO.sig.all,
+                   aes(x=foldEnrich, y=-log10(padjust), colour=-log10(padjust),
+                       size=foldEnrich)) +
+  geom_point() + theme_mike() +
+  scale_colour_gradient(low="#000000", high="#DC143C")
+
+GO.all <- GO.sig.all[order(GO.sig.all$padjust, decreasing=FALSE), ]
+
+pretty.terms <- unlist(lapply(strsplit(GO.all$category, fixed=T, split="_"),
+                              FUN=function(X) str_title_case(gsub(tolower(paste(X[-1], collapse=" ")), perl=TRUE,
+                                                                  pattern="ecm", replacement="ECM"))))
+GO.all$Term <- pretty.terms
+
+
+p.terms <- ggplot(na.omit(GO.all[1:20, ]),
+                  aes(x=reorder(Term, 
+                                foldEnrich),
+           y=foldEnrich,
+           fill=-log10(padjust))) +
+  scale_fill_distiller(palette="Reds", direction=1) +
+  geom_bar(stat='identity') + theme_mike() +
+  scale_x_discrete(labels=function(X) str_wrap(X, width=35)) +
+  coord_flip() + labs(x="Gene Ontology Term", y="Fold Enrichment")
+
+plot_grid(p.enrich, p.terms, ncol=2, rel_widths=c(0.3, 0.7))
+```
+
+Now test the interaction term between the two partitions
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+# the cells are separated along DC2, ergo this should be the test
+# I need to re-infer the original DC2 though
+extra.dc.merge$Kmean.interact <- as.numeric(extra.dc.merge$Kmeans) * extra.dc.merge$DPT1
+
+partition.design.mat <- model.matrix(~ 0 + Kmeans + DPT1 + Kmean.interact + Plate, data=extra.dc.merge)
+
+# fit a linear model
+partition.fit <- lmFit(adipose.nz,
+                       partition.design.mat)
+
+partition.fit <- eBayes(partition.fit)
+partition.sum.res <- summary(decideTests(partition.fit))
+
+int.partition.de.res <- topTable(partition.fit, coef=4, n=Inf, sort="p", p=1.0)
+int.partition.de.res$Sig <- 0
+int.partition.de.res$Sig[int.partition.de.res$adj.P.Val <= 0.01] <- 1
+int.partition.de.res$Sig <- as.factor(int.partition.de.res$Sig)
+
+int.partition.de.res$Diff <- 0
+int.partition.de.res$Diff[int.partition.de.res$logFC < 0 & int.partition.de.res$Sig == 1] <- -1
+int.partition.de.res$Diff[int.partition.de.res$logFC > 0 & int.partition.de.res$Sig == 1] <- 1
+
+int.partition.de.res$gene_id <- rownames(int.partition.de.res)
+int.partition.de.merge <- merge(int.partition.de.res, gene_symbol,
+                            by.x='gene_id', by.y='ensembl_gene_id', all.x=TRUE)
+
+int.partition.gene.top <- int.partition.de.merge$external_gene_name
+#int.partition.gene.top[int.partition.de.merge$Sig == 0] <- ""
+
+# plot the top 6 and bottom 6 gene symbols
+top6 <- int.partition.de.merge$external_gene_name[order(int.partition.de.merge$logFC, decreasing=TRUE)][1:6]
+bottom6 <- int.partition.de.merge$external_gene_name[order(int.partition.de.merge$logFC, decreasing=FALSE)][1:6]
+int.partition.gene.top[!int.partition.gene.top %in% c(top6, bottom6)] <- ""
+
+#int.partition.gene.top[int.partition.de.merge$logFC > -2 & int.partition.de.merge$logFC < 5] <- ""
+#int.partition.gene.top[is.na(int.partition.gene.top)] <- ""
+
+write.table(int.partition.de.merge,
+            file="~/Dropbox/Adipose/Adipose-DEgenes-Kmeans1vs2_interaction-ALL.tsv",
+            sep="\t", quote=F)
+
+int.partition.ma <- ggplot(int.partition.de.merge, aes(x=AveExpr, y=logFC, colour=Sig)) +
+  geom_point(size=1, alpha=0.8) + theme_mike() +
+  scale_colour_manual(values=c("#A3A3A3", "#FF0000")) +
+  labs(x=expression(paste("Mean log"[2], " Expression")),
+       y=expression(paste("log"[2], " Fold Change"))) +
+  guides('colour'=FALSE) +
+  ylim(c(-10, 10)) +
+  geom_label_repel(aes(label=int.partition.gene.top),
+                  colour='black',
+                  nudge_x=0.01,
+                  nudge_y=0.01,
+                  size=3)
+
+ggsave(int.partition.ma,
+       filename="~/Dropbox/Reports_Adipose/Adipogenesis2017/Figures/ALL-interaction-Kmeans1Vs2-MAplot.png",
+       height=4.25, width=6.75, dpi=300)
+
+int.partition.ma
+```
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+table(int.partition.de.merge$Diff)
+```
+
+
+```{r, echo=FALSE, fig.height=6.75, fig.width=12.5}
+part1.int.de <- int.partition.de.merge$gene_id[int.partition.de.merge$Sig == 1 & int.partition.de.merge$Diff == -1]
+part2.int.de <- int.partition.de.merge$gene_id[int.partition.de.merge$Sig == 1 & int.partition.de.merge$Diff == 1]
+
+all.genes <- part1.de.genes$gene_id
+
+gene.length <- gene.tpm$Length[unique(gene.tpm$Name) %in% unique(all.genes)]
+names(gene.length) <- intersect(unique(gene.tpm$Name) , unique(all.genes))
+
+de.big.vector <- as.integer(unique(all.genes) %in% unique(part1.int.de))
+names(de.big.vector) <- unique(all.genes)
+
+de.big.vector <- de.big.vector[intersect(names(de.big.vector), names(gene.length))]
+
+pwf.all <- nullp(de.big.vector, "mm10", "ensGene", bias.data=gene.length[intersect(names(de.big.vector), names(gene.length))],
+                 plot.fit=FALSE)
+GO.wall.all  <- goseq(pwf.all, genome="mm10", id="ensGene", gene2cat=hallmark.go,
+                           method="Wallenius", use_genes_without_cat=T)
+# GO.wall.all <- goseq(pwf.all, genome="mm10", id="ensGene", test.cats=c("GO:BP"),
+#                       method="Wallenius", use_genes_without_cat=T)
+
+# convert 0 p-values to minimal 64-bit float
+GO.wall.all$over_represented_pvalue[GO.wall.all$over_represented_pvalue == 0] <- .Machine$double.xmin
+
+GO.wall.all$padjust <- p.adjust(GO.wall.all$over_represented_pvalue, method="BH")
+GO.wall.all$foldEnrich <- ((GO.wall.all$numDEInCat/length(unique(part1.int.de)))/(GO.wall.all$numInCat/length(gene.length)))
+
+# select on p-value and foldEnrich
+GO.sig.all <- GO.wall.all[(GO.wall.all$padjust <= 0.01), ]
+go_cats.all <- data.frame(GO.sig.all$category, GO.sig.all$foldEnrich)
+
+p.enrich <- ggplot(GO.sig.all,
+                   aes(x=foldEnrich, y=-log10(padjust), colour=-log10(padjust),
+                       size=foldEnrich)) +
+  geom_point() + theme_mike() +
+  scale_colour_gradient(low="#000000", high="#DC143C")
+
+GO.all <- GO.sig.all[order(GO.sig.all$padjust, decreasing=FALSE), ]
+
+pretty.terms <- unlist(lapply(strsplit(GO.all$category, fixed=T, split="_"),
+                              FUN=function(X) str_title_case(gsub(tolower(paste(X[-1], collapse=" ")), perl=TRUE,
+                                                                  pattern="ecm", replacement="ECM"))))
+GO.all$Term <- pretty.terms
+
+p.terms <- ggplot(GO.all[1:20, ],
+                  aes(x=reorder(Term, 
+                                foldEnrich),
+           y=foldEnrich,
+           fill=-log10(padjust))) +
+  scale_fill_distiller(palette="Reds", direction=1) +
+  geom_bar(stat='identity') + theme_mike() +
+  scale_x_discrete(labels=function(X) str_wrap(X, width=35)) +
+  coord_flip() + labs(x="Gene Ontology Term", y="Fold Enrichment")
+
+plot_grid(p.enrich, p.terms, ncol=2)
+```
+
+
+```{r, echo=FALSE, fig.height=6.75, fig.width=12.5}
+all.genes <- part1.de.genes$gene_id
+
+gene.length <- gene.tpm$Length[unique(gene.tpm$Name) %in% unique(all.genes)]
+names(gene.length) <- intersect(unique(gene.tpm$Name) , unique(all.genes))
+
+de.big.vector <- as.integer(unique(all.genes) %in% unique(part2.int.de))
+names(de.big.vector) <- unique(all.genes)
+
+de.big.vector <- de.big.vector[intersect(names(de.big.vector), names(gene.length))]
+
+pwf.all <- nullp(de.big.vector, "mm10", "ensGene", bias.data=gene.length[intersect(names(de.big.vector), names(gene.length))],
+                 plot.fit=FALSE)
+GO.wall.all  <- goseq(pwf.all, genome="mm10", id="ensGene", gene2cat=hallmark.go,
+                           method="Wallenius", use_genes_without_cat=T)
+# GO.wall.all <- goseq(pwf.all, genome="mm10", id="ensGene", test.cats=c("GO:BP"),
+#                       method="Wallenius", use_genes_without_cat=T)
+
+# convert 0 p-values to minimal 64-bit float
+GO.wall.all$over_represented_pvalue[GO.wall.all$over_represented_pvalue == 0] <- .Machine$double.xmin
+
+GO.wall.all$padjust <- p.adjust(GO.wall.all$over_represented_pvalue, method="BH")
+GO.wall.all$foldEnrich <- ((GO.wall.all$numDEInCat/length(unique(part2.int.de)))/(GO.wall.all$numInCat/length(gene.length)))
+
+# select on p-value and foldEnrich
+GO.sig.all <- GO.wall.all[(GO.wall.all$padjust <= 0.01), ]
+go_cats.all <- data.frame(GO.sig.all$category, GO.sig.all$foldEnrich)
+
+p.enrich <- ggplot(GO.sig.all,
+                   aes(x=foldEnrich, y=-log10(padjust), colour=-log10(padjust),
+                       size=foldEnrich)) +
+  geom_point() + theme_mike() +
+  scale_colour_gradient(low="#000000", high="#DC143C")
+
+GO.all <- GO.sig.all[order(GO.sig.all$padjust, decreasing=FALSE), ]
+
+pretty.terms <- unlist(lapply(strsplit(GO.all$category, fixed=T, split="_"),
+                              FUN=function(X) str_title_case(gsub(tolower(paste(X[-1], collapse=" ")), perl=TRUE,
+                                                                  pattern="ecm", replacement="ECM"))))
+GO.all$Term <- pretty.terms
+
+
+p.terms <- ggplot(GO.all,
+                  aes(x=reorder(Term, 
+                                foldEnrich),
+           y=foldEnrich,
+           fill=-log10(padjust))) +
+  scale_fill_distiller(palette="Reds", direction=1) +
+  geom_bar(stat='identity') + theme_mike() +
+  scale_x_discrete(labels=function(X) str_wrap(X, width=35)) +
+  coord_flip() + labs(x="Gene Ontology Term", y="Fold Enrichment")
+
+ggsave(p.terms,
+       filename="~/Dropbox/Reports_Adipose/Adipogenesis2017/Figures/DE_interaction_Part2-Enrich.png",
+       height=3.75, width=6.75, dpi=300)
+
+plot_grid(p.enrich, p.terms, ncol=2, rel_widths=c(0.3, 0.7))
+```
+
+Check the expression of these genes between partitions.
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+# select genes with |log FC| > 2
+part1.int.big <- int.partition.de.merge$gene_id[int.partition.de.merge$Sig == 1 & int.partition.de.merge$logFC < -4]
+part2.int.big <- int.partition.de.merge$gene_id[int.partition.de.merge$Sig == 1 & int.partition.de.merge$logFC > 4]
+
+int.de <- c(part1.int.big, part2.int.big)
+int.exprs <- adipose.nz[int.de, ]
+
+# split into partitions, then internally order cells
+int.annot.df <- extra.dc.merge[, c("Sample", "Orig.DPT1", "Kmeans", "Kmean.interact")]
+rownames(int.annot.df) <- int.annot.df$Sample
+int.annot.df <- int.annot.df[colnames(int.exprs), ]
+int.order <- order(int.annot.df$Kmeans, -int.annot.df$Kmean.interact)
+int.annot.df <- int.annot.df[int.order, ]
+
+# drop the kmeans * DPT interaction column
+int.annot.df <- int.annot.df[, c("Orig.DPT1", "Kmeans")]
+colnames(int.annot.df) <- c("Pseudotime", "Partition")
+
+# add gene annotations
+gene.annot <- do.call(cbind.data.frame,
+                      list("GeneID"=int.de,
+                           "GeneName"=gene_symbol[int.de, ]$external_gene_name,
+                           "Partition"=c(rep("Partition 1", length(part1.int.big)),
+                                         rep("Partition 2", length(part2.int.big)))))
+gene.names <- gene.annot$GeneName
+gene.annot <- data.frame("DE"=gene.annot$Partition)
+rownames(gene.annot) <- gene.names
+
+rownames(int.exprs) <- gene.names
+
+gene.cols <- c("sienna4", "yellow")
+names(gene.cols) <- c("Partition 1", "Partition 2")
+
+dc.cols <- colorRampPalette(c("#FAFF60", "#8615B0"))(dim(int.annot.df)[1])
+names(dc.cols) <- int.annot.df$Orig.DPT1
+
+part.cols <- c("#FF7800", "#002EFF")
+names(part.cols) <- c(1, 2)
+
+label.map <- c("#FF7800", "#FFB200", "#AB611E")
+names(label.map) <- c("Naive", "Intermediate", "Mature")
+
+annot.cols <- list("Pseudotime"=dc.cols,
+                   "Partition"=part.cols,
+                   "DE"=gene.cols)
+
+pheatmap(int.exprs[, int.order],
+         show_rownames=TRUE, show_colnames=FALSE,
+         cluster_cols = FALSE, cluster_rows=FALSE,
+         annotation_col=int.annot.df,
+         annotation_row=gene.annot,
+         annotation_colors=annot.cols,
+         gaps_col=rep(527, 3), gaps_row=rep(5, 3),
+         height=4.5, width=6.75, res=300,
+         filename="~/Dropbox/Reports_Adipose/Adipogenesis2017/Figures/DE_Interaction_partitions-heatmap.png")
+```
+
+
+
+
+
+
+
+Test whether there is an enrichmnet of GFP+ cells in the Naive cluster.
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+# compare against intermediate and mature separately
+dc.merge$ClusterLabel <- as.character(dc.merge$ClusterLabel)
+fisher.test(table(dc.merge$ClusterLabel[dc.merge$ClusterLabel %in% c("Naive", "Intermediate")], 
+                  dc.merge$Marker[dc.merge$ClusterLabel %in% c("Naive", "Intermediate")]))
+```
+
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+# compare against intermediate and mature separately
+dc.merge$ClusterLabel <- as.character(dc.merge$ClusterLabel)
+fisher.test(table(dc.merge$ClusterLabel[dc.merge$ClusterLabel %in% c("Naive", "Mature")], 
+                  dc.merge$Marker[dc.merge$ClusterLabel %in% c("Naive", "Mature")]))
+```
+

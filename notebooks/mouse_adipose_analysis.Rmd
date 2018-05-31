@@ -1,0 +1,1383 @@
+---
+title: 'Adipose: Initial Analyses'
+author: "Mike Morgan"
+output: html_notebook
+---
+
+# Introduction
+
+After the initial QC we're left with 930 single adipocyte precursor cells.  I'll do one more step of QC filtering, which is to remove any cells and genes that have extremely high sparsity (i.e. lot's of zero-values).  This is to help with normalisation and downstream estimation of techinical noise components.  I suspect that if the initial QC is good enough we won't need to remove any more cells, just genes that are essentially not expressed.
+
+## Filtering genes on sparsity
+
+Plot the sparsity across all genes, and select just those expressed in $\geq$ 5% of cells (equivalent to ~46 cells).
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, fig.height=4.5, fig.width=4.5}
+library(reshape2)
+library(RColorBrewer)
+library(lsa)
+library(ggrepel)
+library(pheatmap)
+library(GGally)
+library(limma)
+library(Rtsne)
+library(cowplot)
+library(stringr)
+library(org.Mm.eg.db)
+library(goseq)
+library(biomaRt)
+library(scales)
+library(flashClust)
+library(statmod)
+library(igraph)
+library(stringr)
+source("~/Dropbox/R_sessions/Normalisation_scripts/mouse_adipose_normalisation.R")
+source('~/Dropbox/R_sessions/SingleCellFunctions/single_cell_functions.R')
+```
+
+This allows us to keep expression data on ~10,000 genes.  The first step is to normalise these data to make the values comparable between cells of a) different sizes (i.e. total RNA content/recovery), and b) library sequencing depth.  We do this by calculating a scale factor (size factor) for each cell by first clustering them together, then estimating size factors on pools of single cells.  These pooled cell size factors can be deconvoluted into cell-specific size factors which are used to normalise the data.  The only problem that arises is with very sparse data, these size factors can be very small.  Generally if values are close to 0, then there probably needs to be more stringent QC.
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+clusters <- quickCluster(sce, min.size=180, get.spikes=TRUE)
+sce <- computeSumFactors(sce, sizes=c(60, 70, 80, 90), positive=TRUE,
+                         assay.type='counts', clusters=clusters, get.spikes=TRUE)
+summary(sizeFactors((sce)))
+sce <- normalize(sce)
+```
+
+These values represent a summary of the size factors.  There aren't any values close to 0, so we shouldn't have any problems on that front.  Let's just take a look at how they are distributed though to see if there are lots of small cells or lots of large cells.  I suspect they are all of a similar size as the median is ~0.9 and mean is 1.0.
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.height=4.5, fig.width=7.5}
+par(mfrow=c(1, 2))
+hist(sizeFactors((sce)), breaks=100, main="Histogram of cell size factors")
+abline(v=0.2, lty=2, col="red")
+plot(sizeFactors((sce)), ylab="Size factors", xlab="Cell")
+abline(h=0.2, lty=2, col='red')
+```
+
+These look pretty good, 88% of cell size factors fall within 1 standard deviation of the mean value; another confirmation of the quality of these data!  We have our normalised expression data, now let's start to use it for some exploratory data analysis.  First we'll look at some marker genes from adipocytes and precursors.  Then we'll find highly variable genes (HVG) as these quite often characterise the structure in the data fairly well if there are multiple populations of cells.
+
+### Sanity checking
+
+From the _Cell_ review I've picked out a set of genes that might act as both positive and negative controls, including GFP.
+
+* GFP
+* Pparg$\gamma$, CEBP$\alpha$, Pdgfr$\alpha$/$\beta$ [mature adipocytes]
+* Cd24 (?), Cd29/Itgb1 (?), Sfrp2 (?), Sca1/Ly6a [precursor markers?]
+* BMPR (+), CD34 (+), CD31 (-), Pref-1 (+), Tcf21 (+)
+* Prdm16, FoxC2, necdin [BAT markers]
+* Wt1
+* HoxC9, Shox2, En1 [Subcutaneous WAT]
+* HoxA5, HoxA4, Nr2f1, Thbd, PAPP, SFRP1, Angiotensin [Visceral WAT]
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+adipose.exprs <- as.data.frame(exprs(sce))
+# remove the multi-cell
+multi.cell <- adipose.meta$Sample[adipose.meta$Cell == "Multi"]
+adipose.exprs <- adipose.exprs[, !colnames(adipose.exprs) %in% multi.cell]
+rownames(adipose.exprs) <- adipose$gene_id[keep_genes]
+
+ensembl <- useEnsembl(biomart='ensembl', dataset='mmusculus_gene_ensembl', GRCh=37)
+
+gene_symbol <- getBM(attributes=c('ensembl_gene_id', 'external_gene_name'),
+                     filters='ensembl_gene_id', mart=ensembl,
+                     values=adipose$gene_id[keep_genes])
+adipose.exprs$gene_id <- rownames(adipose.exprs)
+adipose.merge <- merge(adipose.exprs, gene_symbol, by.x="gene_id", by.y="ensembl_gene_id", all.x=TRUE)
+adipose.merge$external_gene_name[adipose.merge$gene_id == "eGFP"] <- "GFP"
+```
+
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.height=4.5, fig.width=9.5}
+marker.genes <- c("GFP", "Pparg", "Cebpa", "Bmpr1a", "Bmpr1b", "Bmpr2", "Cd34", "Pecam1", "Ly6a",
+                  "Dlk1", "Tcf21", "Prdm16", "Foxc2", "Ndn", "Wt1", "HoxC9", "Shox2", "En1", "Sfrp2",
+                  "Hoxa5", "Hoxa4", "Nr2f1", "Thbd", "Pappa", "Sfrp1", "Agt", "Cd24a", "Itgb1",
+                  "Pdgfra", "Pdgfrb")
+marker.exprs <- adipose.merge[adipose.merge$external_gene_name %in% marker.genes, ]
+
+marker.melt <- melt(marker.exprs, id.vars=c("gene_id", "external_gene_name"))
+
+ggplot(marker.melt, aes(x=external_gene_name, y=value, colour=external_gene_name)) +
+  geom_jitter(alpha=0.4) + theme_mike() +
+  scale_colour_Publication() +
+  theme(axis.text.x=element_text(angle=90)) +
+  labs(x="Gene Symbol", y=expression(paste("log"[2], " Normalised Expression")))
+```
+
+OK, so the marker genes that are absent are _Bmpr1b_ (+?), _Cd31_ (-), _Dlk1_/_Pref1_ (+), _Prdm16_ (-), _FoxC2_ (-), _HoxC9_ (-), _Shox2_ (-), _En1_ (-) & _HoxA4_ (-?).  I've put +/- next to whether I think they should be a positive or negative control gene, and (+?/-?) if I'm not sure.  These latter genes are ones that are expressed in mature adipocytes (visceral and/or subcutaneous), so it is not clear whether they would be expressed.  Necdin (_Ndn_) is quite highly expressed, but is apparently more a marker for BAT.  _Cd24_ is absent, but the Nature Cell Biology paper states 60-90% of _Wt1_ cells are derived from the CD24- fraction; CD29 (_Itgb1_) is pretty highly expressed on most cells.  The only gene that I think should be expressed in these cells, but is absent, is _Pref-1_/_Dlk1_, which is supposed to be the only widely accepted marker of preadipocytes apparently?!
+
+### Highly variable genes and cell clustering
+
+Most of the genes we expect to see in these cells appear to be there.  Now let's see if there is anything interesting in the structure of these cells.  First I'll define a set of genes which are more variable than we would expect due to technical variation inherent in single cell expression data.  The number of HVG is quite dependent on the underlying data, and particularly the structure.  If there are distinct cell types then we might expect to see more HVG, with good discriminatory power.  However, if there are very few, or closely related groups of cells we will observe fewer HVGs.  I will use the HVG to explore the high-dimensional structure in the data using some common data visualisation techniques for this purpose, i.e. visualising high-dimensional relationships between cells in 2 dimensions.  If there is indistinct clustering this might be because there is no inherent structure in the data, but it may also be because the HVG capture insufficient information to resconstruct this underlying structure.  If this is the case then I'll select a larger set of variable genes for visualisation.
+
+#### Define highly variable genes
+
+First look at the relationship between the mean and variance in these data.  They should look like an exponential relationship with high variance and lowly expressed genes.
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+adipose.nz <- adipose.exprs[, -(dim(adipose.exprs)[2])]
+adipose.nz$gene_id <- rownames(adipose.nz)
+write.table(adipose.nz,
+            file="~/Dropbox/Adipose/Adipose-SF_norm.tsv",
+            sep="\t", quote=F)
+
+means <- rowMeans(adipose.nz[, -ncol(adipose.nz)], na.rm = T)
+vars <- apply(adipose.nz[, -ncol(adipose.nz)], 1, var, na.rm=T)
+cv2 <- vars/(means^2)
+
+smoothScatter(means, cv2, xlab="Mean expression", ylab=expression("CV"^2))
+```
+
+That is exactly the relationship we should expect to see.  We will now fit a general linear model using a gamma distribution to account for this mean-variance dependence.  This will give us a distribution from which we can then test which genes are more variable than we would expect based on this fit.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+# calculate highly variable genes from a model fit
+# find the minimum mean prior to fitting
+minMeanForFit <- unname(quantile(means[which(cv2 > 0.2)], 0.8))
+
+# select genes with mean value greater than min value for fitting
+useForFit <- 1/means == 1
+
+# fit with a gamma-distributed GLM
+fit <- glmgam.fit(cbind(a0 = 1, a1tilde=1/means[!useForFit]), cv2[!useForFit])
+
+# calculate % variance explained by the model fit
+resid.var <- var(fitted.values(fit) - cv2[!useForFit])
+total.var <- var(cv2[!useForFit])
+
+# get fitted values and mean-dispersion dependence line
+a0 <- unname(fit$coefficients["a0"])
+a1 <- unname(fit$coefficients["a1tilde"])
+
+xg <- seq(0, max(means[means != Inf]), length.out=100000)
+vfit <- (a1/xg) + a0
+
+# add confidence intervals
+d.f <- ncol(adipose.nz) - 1
+
+# rank genes by the significance of their deviation from the fit
+# to call HVGs
+a.fit <- (a1/means) + a0
+varFitRatio <- vars/(a.fit * means^2)
+varOrder <- order(varFitRatio, decreasing=T)
+
+oed <- adipose.nz[varOrder, -ncol(adipose.nz)]
+smoothScatter(means, cv2,xlab="Mean expression", ylab=expression("CV"^2))
+lines(xg, vfit, col="black", lwd=3 )
+lines(xg, vfit * qchisq(0.975, d.f)/d.f, lty=2, col="black")
+lines(xg, vfit * qchisq(0.025, d.f)/d.f,lty=2,col="black")
+
+# display the 100 most highly variable genes
+points(means[varOrder[1:100]], cv2[varOrder[1:100]], col='red')
+```
+
+The red circles here represent the top 100 genes which are most highly variable across all 930 cells.  Now let's formally test these deviations from th expected fit (black line) and define a set of highly variable genes.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+pvals <- pchisq(varFitRatio * d.f, d.f, lower.tail = FALSE)
+pvals[is.na(pvals)] <- 1.0
+adj.pvals <- p.adjust(pvals, method='fdr')
+HVG <- adj.pvals <= 1e-2
+write.table(cbind(HVG),
+            file="~/Dropbox/Adipose/Adipose-HVG.tsv",
+            sep="\t", quote=F)
+table(HVG)
+```
+
+We have a set of 2804 genes that are more variable than we would expect based on a $\chi^2$ distribution.  With this many genes I would expect to see some structure in the data that represents different groups of cells.  Let's take a look.
+
+#### Cell clustering and high dimensional visualisation
+
+First I'll do a hierarchical clustering using the HVG across all 930 cells.  Due to the "curse of dimensionality", it is tricky to get meaningful pair-wise distances between points in high dimensions.  For the sake of this clustering and visualisation, I'll use a dimensionality reduction technique, principal components analysis.  I'll then take the first N components which capture the majority of the variability (75%) in the data.  This will give us a reasonable view of whether there is much structure, or if there are distinct groups of cells.  Then I'll do the high-dimensional visualisation (it sounds more impressive than it is).  For this I'll use a technique called t-stochastic neighbour embedding (tSNE).  This is generally a good method for visualising high dimensional relationships in 2 dimensions.  This is a non-deterministic method, so I'll set the random seed so we can recover the same result each time.
+
+A way to deal with this curse of dimensionality is to use graph-based clustering on reduced dimensions.  One such approach is the k-nearest neighbour graph.  This network of cells can then be used to define small world communities (clusters) using community detection algorithms.
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+adipose.hvg <- adipose.nz[HVG, -ncol(adipose.nz)]
+adipose.hvg[is.na(adipose.hvg)] <- 0
+
+# cluster cells on the basis of their HVGs
+# reduce the dimensionality to 50 components?  Then calculate the scores
+# select N components that account for >= 75% of variance
+adipose.pca <- prcomp(t(adipose.hvg), center=TRUE, scale=TRUE)
+var.exp <- adipose.pca$sdev**2/sum(adipose.pca$sdev**2)
+sum.var <- 0
+n.comps <- 0
+for(x in 1:length(var.exp)){
+  while(sum.var < 0.75){
+    sum.var <- sum.var + var.exp[x]
+    n.comps <- n.comps + 1
+  }
+}
+
+adipose.pcs <- as.data.frame(t(adipose.pca$x[, 1:n.comps]))
+adipose.cor <- cor(adipose.pcs, method='pearson')
+
+adipose.cor[is.na(adipose.cor)] <- 0
+spearman.dist <- as.dist(1 - adipose.cor)
+spearman.tree <- flashClust(spearman.dist, method='average')
+plot(spearman.tree)
+```
+
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+set.seed(42)
+adipose.knn <- buildSNNGraph(adipose.hvg, d=n.comps, k=12, pc.approx=TRUE)
+adipose.trap <- cluster_walktrap(adipose.knn, steps=4)
+adipose.cluster <- do.call(cbind.data.frame, list("Sample"=colnames(adipose.hvg),
+                                                   "Cluster"=adipose.trap$membership))
+# # # swap clusters 1 and 2 around for consistency.
+# adipose.cluster$Cluster[adipose.cluster$Cluster == 3] <- 5
+# adipose.cluster$Cluster[adipose.cluster$Cluster == 2] <- 3
+# adipose.cluster$Cluster[adipose.cluster$Cluster == 5] <- 2
+
+#adipose.cluster$Cluster[adipose.cluster$Cluster == 5] <- 3
+
+meta.merge <- merge(adipose.meta, adipose.cluster, by="Sample")
+meta.merge$Cluster <- as.factor(meta.merge$Cluster)
+write.table(meta.merge,
+            file="~/Dropbox/Adipose/Adipose-metaMerge.tsv",
+            sep="\t", quote=F)
+
+table(adipose.cluster$Cluster)
+```
+
+That is a very dense dendrogram, so it's hard to draw any strong conclusions from it.  There do look to be several distinct branches of cells, that contain many closely related nodes.  I'll plot these data in a heatmap, and look at how they cluster according to some of the experimental information, i.e. GFP expression, plate, etc.
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.height=9.5, fig.width=9.5}
+rownames(meta.merge) <- meta.merge$Sample
+hm.col <- rev(colorRampPalette(brewer.pal(9, "RdYlBu"))(100))
+annot.df <- meta.merge[, c("Plate", "Marker", "Cluster")]
+annot.df$Plate <- as.factor(annot.df$Plate)
+annot.df$Marker <- as.factor(annot.df$Marker)
+#annot.df$Cell <- as.factor(annot.df$Cell)
+
+plate.cols <- c("#386cb0", "#fdb462","#7fc97f")
+names(plate.cols) <- as.factor(c(6, 7, 8))
+
+marker.cols <- c("#13CF00", "#CC8EF4")
+names(marker.cols) <- as.factor(c("GFP+", "GFP-"))
+
+cell.cols <- c("#fb9a99","#984ea3")
+names(cell.cols) <- as.factor(c("Multi", "Single"))
+
+cluster.cols <- c("#8CD3C7FF", "#BEBADAFF", "#FFED70FF", "#FC8072FF")
+names(cluster.cols) <- c(1, 3, 2, 4)
+
+annot.cols <- list(Plate=plate.cols,
+                   Marker=marker.cols,
+                   #Cell=cell.cols,
+                   Cluster=cluster.cols)
+  
+pheatmap(adipose.cor, show_rownames=FALSE, show_colnames=FALSE,
+         color=hm.col, #cutree_col=4, cutree_row=4,
+         annotation_col=annot.df, annotation_row=annot.df,
+         clustering_method="average",
+         annotation_colors=annot.cols,
+         dist=as.dist(1 - adipose.cor),
+         filename="~/Dropbox/Reports_Adipose/Adipogenesis2017/Figures/AllCells-heatmap.png",
+         height=6.75, width=7.75, res=300)
+```
+
+
+There's quite a lot going on this heatmap.  The first thing to note is that the graph-based clustering can group the cells into 4 clusters.  These clusters are a little heterogenous, and might indicate that there are fewer groups of cells than this, or they are all quite closely related.  There is definitely some heterogeneity in these adipose precursors, that much is evident.  It is also worth noting that the groups are not distinguised by the plate on which they were sorted (good news), and interestingly they all contain both GFP+ and GFP- cells.  The two remaining multi-cell control cells (on the far left of the heatmap), cluster quite separately from the other cells.  This highlights the inherent heterogeneity in single cell data that is of a technical, rather than biological, origin.
+
+We can get a better view than this using dimensionality reduction with tSNE.  That way we will also get a better idea of how many groups of cells there are, and how distinct they are from each other.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, fig.height=7.5, fig.width=7.5}
+# get low dimensional embedding of genes by tSNE
+set.seed(130436)
+adipose.hvg <- adipose.hvg[, !duplicated(t(adipose.hvg))]
+adipose.tsne <- Rtsne(t(adipose.hvg), perplexity=30)
+adipose.map <- data.frame(adipose.tsne$Y)
+colnames(adipose.map) <- c("Dim1", "Dim2")
+adipose.map$Sample <- colnames(adipose.hvg)
+adipose.uber <- merge(adipose.map, meta.merge,
+                      by='Sample')
+adipose.uber$Cluster <- as.factor(adipose.uber$Cluster)
+
+tsne.plate <- ggplot(adipose.uber,
+                     aes(x=Dim1, y=Dim2, colour=as.factor(Plate))) + 
+  geom_point(size=1) + theme_mike() +
+  scale_colour_Publication() +
+  labs(x="tSNE Dimension 1", y="tSNE Dimension 2")
+
+tsne.gfp <- ggplot(adipose.uber,
+                     aes(x=Dim1, y=Dim2, colour=Marker)) + 
+  geom_point(size=1) + theme_mike() +
+  scale_colour_Publication() +
+  labs(x="tSNE Dimension 1", y="tSNE Dimension 2")
+
+tsne.cluster <- ggplot(adipose.uber,
+                     aes(x=Dim1, y=Dim2, colour=Cluster)) + 
+  geom_point(size=1) + theme_mike() +
+  scale_colour_Publication() +
+  labs(x="tSNE Dimension 1", y="tSNE Dimension 2")
+
+tsne.platecol <- ggplot(adipose.uber,
+                     aes(x=Dim1, y=Dim2, colour=PlateColumn)) + 
+  geom_point(size=1) + theme_mike() +
+  scale_colour_Publication() +
+  labs(x="tSNE Dimension 1", y="tSNE Dimension 2")
+
+
+plot_grid(tsne.plate, tsne.platecol,
+          tsne.gfp, tsne.cluster,
+          labels=c("Plate", "Plate Column",
+                   "GFP", "Clusters"),
+          ncol=2)
+```
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+gfp.cols <- c("#13CF00", "#CC8EF4")
+names(gfp.cols) <- c("GFP+", "GFP-")
+
+tsne.gfp <- ggplot(adipose.uber,
+                     aes(x=Dim1, y=Dim2, colour=Marker)) + 
+  geom_point(size=1) + theme_mike() +
+  scale_colour_manual(values=gfp.cols) +
+  labs(x="tSNE Dimension 1", y="tSNE Dimension 2")
+
+ggsave(tsne.gfp,
+       filename="~/Dropbox/Reports_Adipose/Adipogenesis2017/Figures/tSNE_byGFP.png",
+       height=4.5, width=4.5, dpi=300)
+```
+
+
+That is a big ball of cells!  Again, none of the structure is due to the plate effects (upper left), so it doesn't look like there are any particularly strong batch effects from the plates.  Nor is the clustering due to the positions on the plates (upper right).  There are groups of cells that cluster together on GFP (lower left), they don't look uniformly distributed across the tSNE plot.  There does look like there is structure, but it's quite hard to discern anything obvious.  The same goes for the clusters I defined earlier (lower left); whilst you can see distinct regions based on these clusters, there is a lot of overlap suggesting indistinct boundaries between these clusters.  This might well fit with presence of a developmental process going on, with some less mature cells, and some more mature.  This calls for some pseudotemporal ordering, but first I want to see how the marker genes from earlier are distributed across this low dimensional representation; maybe some markers are more highly expressed in some areas compared to others?
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.height=9.5, fig.width=9.5}
+marker.trans <- as.data.frame(apply(as.data.frame(t(marker.exprs)[2:931 ,]),
+                                    2, as.numeric))
+colnames(marker.trans) <- marker.exprs$external_gene_name
+marker.trans$Sample <- colnames(marker.exprs)[2:931]
+tsne.markers <- merge(adipose.uber, marker.trans, by='Sample')
+
+tsne.gfp <- ggplot(tsne.markers,
+                     aes(x=Dim1, y=Dim2, colour=GFP)) + 
+  geom_point(size=1) + theme_mike() +
+  scale_colour_distiller(palette="RdYlBu") +
+  labs(x="tSNE Dimension 1", y="tSNE Dimension 2")
+
+tsne.wt1 <- ggplot(tsne.markers,
+                     aes(x=Dim1, y=Dim2, colour=Wt1)) + 
+  geom_point(size=1) + theme_mike() +
+  scale_colour_distiller(palette="RdYlBu") +
+  labs(x="tSNE Dimension 1", y="tSNE Dimension 2")
+
+
+tsne.cd34 <- ggplot(tsne.markers,
+                     aes(x=Dim1, y=Dim2, colour=Cd34)) + 
+  geom_point(size=1) + theme_mike() +
+  scale_colour_distiller(palette="RdYlBu") +
+  labs(x="tSNE Dimension 1", y="tSNE Dimension 2")
+
+tsne.pparg <- ggplot(tsne.markers,
+                     aes(x=Dim1, y=Dim2, colour=Pparg)) + 
+  geom_point(size=1) + theme_mike() +
+  scale_colour_distiller(palette="RdYlBu") +
+  labs(x="tSNE Dimension 1", y="tSNE Dimension 2")
+
+tsne.cebpa <- ggplot(tsne.markers,
+                     aes(x=Dim1, y=Dim2, colour=Cebpa)) + 
+  geom_point(size=1) + theme_mike() +
+  scale_colour_distiller(palette="RdYlBu") +
+  labs(x="tSNE Dimension 1", y="tSNE Dimension 2")
+
+tsne.cd29 <- ggplot(tsne.markers,
+                     aes(x=Dim1, y=Dim2, colour=Itgb1)) + 
+  geom_point(size=1) + theme_mike() +
+  scale_colour_distiller(palette="RdYlBu") +
+  labs(x="tSNE Dimension 1", y="tSNE Dimension 2")
+
+tsne.thbd <- ggplot(tsne.markers,
+                     aes(x=Dim1, y=Dim2, colour=Thbd)) + 
+  geom_point(size=1) + theme_mike() +
+  scale_colour_distiller(palette="RdYlBu") +
+  labs(x="tSNE Dimension 1", y="tSNE Dimension 2")
+
+tsne.tcf21 <- ggplot(tsne.markers,
+                     aes(x=Dim1, y=Dim2, colour=Tcf21)) + 
+  geom_point(size=1) + theme_mike() +
+  scale_colour_distiller(palette="RdYlBu") +
+  labs(x="tSNE Dimension 1", y="tSNE Dimension 2")
+
+tsne.ndn <- ggplot(tsne.markers,
+                     aes(x=Dim1, y=Dim2, colour=Ndn)) + 
+  geom_point(size=1) + theme_mike() +
+  scale_colour_distiller(palette="RdYlBu") +
+  labs(x="tSNE Dimension 1", y="tSNE Dimension 2")
+
+
+plot_grid(tsne.gfp, tsne.wt1, tsne.cd34, 
+          tsne.pparg, tsne.cebpa, tsne.tcf21,
+          tsne.cd29, tsne.thbd, tsne.ndn,
+          labels=c("GFP", "Wt1", "Cd34", "Pparg", "Cebpa", "Tcf21",
+                   "Cd29", "Thbd", "Ndn"),
+          ncol=3)
+```
+
+From these 9 genes we can see that _Cd34_ & _Cd29_ are pretty ubiquitous across all precursor cells.  The low expression/absent cells probably represent technical dropout events.  GFP transcript detection is quite sporadic, and doesn't necessarily represent an absence of GFP protein.  This highlights one of the limitations of single cell approaches.  I don't know what the promoter dynamics of _Wt1_ are like, but if it has quite bursty transcription this might be the reason for the more sporadic GFP expression in the GFP+ cells.  Markers of mature adipocytes are low and quite sporadically expressed (_Pparg_ & _Cebpa_), which indicates that most of these cells are at least non-mature adipocytes.  What proportion of the SVF GFP- fraction would be mature adipocytes?
+
+There are two curious patterns of expression here, _Tcf21_ and _Thbd_, which are both highly expressed in a large set of overlapping cells.  High expression of _Thbd_ has been reported in intraabdominal epidymal SVF compared to subcutaneous adipocytes.  _Thbd_ encodes thrombomodulin, a glycoprotein highly expressed on endothelial and platlet cells.  _Tcf21_ in the literature appears to differentiate between WAT and BAT, but also showed a anteroposterior expression pattern (higher in posterior depots).
+
+Is the complexity in these data in anyway seperable on the basis of GFP selection?
+
+The million dollar question with these data is can we find a developmental trajectory of cells?  If so, can we also identify genes that represent different stages and cell fate decision points along the trajectory?  I'll leave that for a separate report though.
+
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+gfp_pos.cells <- meta.merge$Sample[meta.merge$Marker == "GFP+"]
+gfp_neg.cells <- meta.merge$Sample[meta.merge$Marker == "GFP-"]
+
+gfp_pos.adipose <- adipose.nz[, colnames(adipose) %in% gfp_pos.cells]
+gfp_neg.adipose <- adipose.nz[, colnames(adipose) %in% gfp_neg.cells]
+
+gfp_pos.hvg <- gfp_pos.adipose[find_hvg(gfp_pos.adipose), ]
+gfp_neg.hvg <- gfp_neg.adipose[find_hvg(gfp_neg.adipose), ]
+
+gfp_pos.hvg <- gfp_pos.hvg[, !duplicated(t(gfp_pos.hvg))]
+gfp_neg.hvg <- gfp_neg.hvg[, !duplicated(t(gfp_neg.hvg))]
+```
+
+There are many fewer highly variable genes in the GFP- cells, than the GFP+ cells.  Does this suggest they are actually _more_ homogenous as a population?  Let's take a look at the tSNE plots for these two cell groups, what does the PCA look like over the first 2-3 components?
+
+```{r, echo=FALSE, fig.height=7.5, fig.width=7.5}
+gfp_pos.pca <- prcomp(t(gfp_pos.hvg))
+gfp_neg.pca <- prcomp(t(gfp_neg.hvg))
+
+gfp_pos.pcs <- as.data.frame(gfp_pos.pca$x)
+colnames(gfp_pos.pcs) <- paste0("PC", 1:dim(gfp_pos.pcs)[2])
+gfp_pos.pcs$Sample <- colnames(gfp_pos.hvg)
+gfp_pos.pca.merge <- merge(gfp_pos.pcs, meta.merge,
+                           by='Sample')
+
+gfp_neg.pcs <- as.data.frame(gfp_neg.pca$x)
+colnames(gfp_neg.pcs) <- paste0("PC", 1:dim(gfp_neg.pcs)[2])
+gfp_neg.pcs$Sample <- colnames(gfp_neg.hvg)
+gfp_neg.pca.merge <- merge(gfp_neg.pcs, meta.merge,
+                           by='Sample')
+
+
+pca.pos <- ggplot(gfp_pos.pca.merge,
+                  aes(x=PC1, y=PC2, colour=Cluster)) +
+  geom_point() + theme_mike() +
+  scale_colour_Publication()
+
+pca.pos.d2 <- ggplot(gfp_pos.pca.merge,
+                  aes(x=PC2, y=PC3, colour=Cluster)) +
+  geom_point() + theme_mike() +
+  scale_colour_Publication()
+
+
+pca.neg <- ggplot(gfp_neg.pca.merge,
+                  aes(x=PC1, y=PC2, colour=Cluster)) +
+  geom_point() + theme_mike() +
+  scale_colour_Publication()
+
+pca.neg.d2 <- ggplot(gfp_neg.pca.merge,
+                  aes(x=PC2, y=PC3, colour=Cluster)) +
+  geom_point() + theme_mike() +
+  scale_colour_Publication()
+
+plot_grid(pca.pos, pca.pos.d2, pca.neg, pca.neg.d2, labels=c("GFP+", "GFP+", "GFP-", "GFP-"),
+          ncol=2)
+```
+
+
+```{r, fig.height=7.5, fig.width=7.5, echo=FALSE}
+set.seed(24021982)
+gfp_pos.tsne <- as.data.frame(Rtsne(t(gfp_pos.hvg), perplexity=30, dims=4)$Y)
+gfp_neg.tsne <- as.data.frame(Rtsne(t(gfp_neg.hvg), perplexity=30, dims=4)$Y)
+
+colnames(gfp_pos.tsne) <- c("Dim1", "Dim2", "Dim3", "Dim4")
+gfp_pos.tsne$Sample <- colnames(gfp_pos.hvg)
+gfp_pos.uber <- merge(gfp_pos.tsne, meta.merge,
+                      by='Sample')
+
+colnames(gfp_neg.tsne) <- c("Dim1", "Dim2", "Dim3", "Dim4")
+gfp_neg.tsne$Sample <- colnames(gfp_neg.hvg)
+gfp_neg.uber <- merge(gfp_neg.tsne, meta.merge,
+                      by='Sample')
+
+
+tsne.gfp_pos <- ggplot(gfp_pos.uber,
+                     aes(x=Dim1, y=Dim2, colour=as.factor(Marker))) + 
+  geom_point(size=1) + theme_mike() +
+  scale_colour_Publication() +
+  labs(x="tSNE Dimension 1", y="tSNE Dimension 2")
+
+tsne.gfp_pos.d2 <- ggplot(gfp_pos.uber,
+                     aes(x=Dim2, y=Dim3, colour=as.factor(Marker))) + 
+  geom_point(size=1) + theme_mike() +
+  scale_colour_Publication() +
+  labs(x="tSNE Dimension 2", y="tSNE Dimension 3")
+
+
+
+tsne.gfp_neg <- ggplot(gfp_neg.uber,
+                     aes(x=Dim1, y=Dim2, colour=as.factor(Marker))) + 
+  geom_point(size=1) + theme_mike() +
+  scale_colour_Publication() +
+  labs(x="tSNE Dimension 1", y="tSNE Dimension 2")
+
+tsne.gfp_neg.d2 <- ggplot(gfp_neg.uber,
+                     aes(x=Dim2, y=Dim3, colour=as.factor(Marker))) + 
+  geom_point(size=1) + theme_mike() +
+  scale_colour_Publication() +
+  labs(x="tSNE Dimension 2", y="tSNE Dimension 3")
+
+
+plot_grid(tsne.gfp_pos, tsne.gfp_pos.d2, tsne.gfp_neg, tsne.gfp_neg.d2,
+          ncol=2)
+```
+
+tSNE of GFP +ve cells with different adipocyte precursor cell markers.
+
+```{r, echo=FALSE, fig.height=9.5, fig.width=9.5}
+gfp_pos.markers <- merge(gfp_pos.uber, marker.trans, by='Sample')
+
+tsne.gfp <- ggplot(gfp_pos.markers,
+                     aes(x=Dim1, y=Dim2, colour=GFP)) + 
+  geom_point(size=1) + theme_mike() +
+  scale_colour_distiller(palette="RdYlBu") +
+  labs(x="tSNE Dimension 1", y="tSNE Dimension 2")
+
+
+tsne.wt1 <- ggplot(gfp_pos.markers,
+                     aes(x=Dim1, y=Dim2, colour=Wt1)) + 
+  geom_point(size=1) + theme_mike() +
+  scale_colour_distiller(palette="RdYlBu") +
+  labs(x="tSNE Dimension 1", y="tSNE Dimension 2")
+
+
+tsne.cd34 <- ggplot(gfp_pos.markers,
+                     aes(x=Dim1, y=Dim2, colour=Cd34)) + 
+  geom_point(size=1) + theme_mike() +
+  scale_colour_distiller(palette="RdYlBu") +
+  labs(x="tSNE Dimension 1", y="tSNE Dimension 2")
+
+tsne.pparg <- ggplot(gfp_pos.markers,
+                     aes(x=Dim1, y=Dim2, colour=Pparg)) + 
+  geom_point(size=1) + theme_mike() +
+  scale_colour_distiller(palette="RdYlBu") +
+  labs(x="tSNE Dimension 1", y="tSNE Dimension 2")
+
+tsne.cebpa <- ggplot(gfp_pos.markers,
+                     aes(x=Dim1, y=Dim2, colour=Cebpa)) + 
+  geom_point(size=1) + theme_mike() +
+  scale_colour_distiller(palette="RdYlBu") +
+  labs(x="tSNE Dimension 1", y="tSNE Dimension 2")
+
+tsne.cd29 <- ggplot(gfp_pos.markers,
+                     aes(x=Dim1, y=Dim2, colour=Itgb1)) + 
+  geom_point(size=1) + theme_mike() +
+  scale_colour_distiller(palette="RdYlBu") +
+  labs(x="tSNE Dimension 1", y="tSNE Dimension 2")
+
+tsne.thbd <- ggplot(gfp_pos.markers,
+                     aes(x=Dim1, y=Dim2, colour=Thbd)) + 
+  geom_point(size=1) + theme_mike() +
+  scale_colour_distiller(palette="RdYlBu") +
+  labs(x="tSNE Dimension 1", y="tSNE Dimension 2")
+
+tsne.tcf21 <- ggplot(gfp_pos.markers,
+                     aes(x=Dim1, y=Dim2, colour=Tcf21)) + 
+  geom_point(size=1) + theme_mike() +
+  scale_colour_distiller(palette="RdYlBu") +
+  labs(x="tSNE Dimension 1", y="tSNE Dimension 2")
+
+tsne.ndn <- ggplot(gfp_pos.markers,
+                     aes(x=Dim1, y=Dim2, colour=Ndn)) + 
+  geom_point(size=1) + theme_mike() +
+  scale_colour_distiller(palette="RdYlBu") +
+  labs(x="tSNE Dimension 1", y="tSNE Dimension 2")
+
+
+plot_grid(tsne.gfp, tsne.wt1, tsne.cd34, 
+          tsne.pparg, tsne.cebpa, tsne.tcf21,
+          tsne.cd29, tsne.thbd, tsne.ndn,
+          labels=c("GFP", "Wt1", "Cd34", "Pparg", "Cebpa", "Tcf21",
+                   "Cd29", "Thbd", "Ndn"),
+          ncol=3)
+```
+
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.height=9.5, fig.width=9.5}
+gfp_neg.markers <- merge(gfp_neg.uber, marker.trans, by='Sample')
+
+tsne.gfp <- ggplot(gfp_neg.markers,
+                     aes(x=Dim1, y=Dim2, colour=GFP)) + 
+  geom_point(size=1) + theme_mike() +
+  scale_colour_distiller(palette="RdYlBu") +
+  labs(x="tSNE Dimension 1", y="tSNE Dimension 2")
+
+
+tsne.wt1 <- ggplot(gfp_neg.markers,
+                     aes(x=Dim1, y=Dim2, colour=Wt1)) + 
+  geom_point(size=1) + theme_mike() +
+  scale_colour_distiller(palette="RdYlBu") +
+  labs(x="tSNE Dimension 1", y="tSNE Dimension 2")
+
+
+tsne.cd34 <- ggplot(gfp_neg.markers,
+                     aes(x=Dim1, y=Dim2, colour=Cd34)) + 
+  geom_point(size=1) + theme_mike() +
+  scale_colour_distiller(palette="RdYlBu") +
+  labs(x="tSNE Dimension 1", y="tSNE Dimension 2")
+
+tsne.pparg <- ggplot(gfp_neg.markers,
+                     aes(x=Dim1, y=Dim2, colour=Pparg)) + 
+  geom_point(size=1) + theme_mike() +
+  scale_colour_distiller(palette="RdYlBu") +
+  labs(x="tSNE Dimension 1", y="tSNE Dimension 2")
+
+tsne.cebpa <- ggplot(gfp_neg.markers,
+                     aes(x=Dim1, y=Dim2, colour=Cebpa)) + 
+  geom_point(size=1) + theme_mike() +
+  scale_colour_distiller(palette="RdYlBu") +
+  labs(x="tSNE Dimension 1", y="tSNE Dimension 2")
+
+tsne.cd29 <- ggplot(gfp_neg.markers,
+                     aes(x=Dim1, y=Dim2, colour=Itgb1)) + 
+  geom_point(size=1) + theme_mike() +
+  scale_colour_distiller(palette="RdYlBu") +
+  labs(x="tSNE Dimension 1", y="tSNE Dimension 2")
+
+tsne.thbd <- ggplot(gfp_neg.markers,
+                     aes(x=Dim1, y=Dim2, colour=Thbd)) + 
+  geom_point(size=1) + theme_mike() +
+  scale_colour_distiller(palette="RdYlBu") +
+  labs(x="tSNE Dimension 1", y="tSNE Dimension 2")
+
+tsne.tcf21 <- ggplot(gfp_neg.markers,
+                     aes(x=Dim1, y=Dim2, colour=Tcf21)) + 
+  geom_point(size=1) + theme_mike() +
+  scale_colour_distiller(palette="RdYlBu") +
+  labs(x="tSNE Dimension 1", y="tSNE Dimension 2")
+
+tsne.ndn <- ggplot(gfp_neg.markers,
+                     aes(x=Dim1, y=Dim2, colour=Ndn)) + 
+  geom_point(size=1) + theme_mike() +
+  scale_colour_distiller(palette="RdYlBu") +
+  labs(x="tSNE Dimension 1", y="tSNE Dimension 2")
+
+
+plot_grid(tsne.gfp, tsne.wt1, tsne.cd34, 
+          tsne.pparg, tsne.cebpa, tsne.tcf21,
+          tsne.cd29, tsne.thbd, tsne.ndn,
+          labels=c("GFP", "Wt1", "Cd34", "Pparg", "Cebpa", "Tcf21",
+                   "Cd29", "Thbd", "Ndn"),
+          ncol=3)
+```
+
+
+Both of these sets of tSNE plots look a bit more interesting now.  The GFP +ve cells are almost starting to look like a trajectory, whilst the GFP -ve cells look more like two populations of closely related cells.  Let's try to construct two different trajectories then in the next report.
+
+What, if any expression differences exist between the GFP+ and GFP- cells?  Are any differences meaningful or biologically relevant?
+
+### Differential expression analysis of GFP+ vs. GFP- cells
+
+```{r, echo=FALSE, fig.height=4.5, fig.width=6.5}
+multi.cell <- meta.merge$Sample[meta.merge$Cell == "Multi"]
+design.mat <- model.matrix(~ Plate + Marker, data=adipose.uber[!adipose.uber$Sample %in% multi.cell, ])
+
+# fit a linear model
+fit <- limma::lmFit(adipose.nz[, -ncol(adipose.nz)], design.mat)
+fit <- limma::eBayes(fit)
+sum.res <- summary(limma::decideTests(fit))
+
+de.res <- limma::topTable(fit, coef="MarkerGFP+", n=Inf, sort="p", p=1.0)
+de.res$Sig <- 0
+de.res$Sig[de.res$adj.P.Val <= 0.01] <- 1
+de.res$Sig <- as.factor(de.res$Sig)
+
+de.res$Diff <- 0
+de.res$Diff[de.res$logFC < 0 & de.res$Sig == 1] <- -1
+de.res$Diff[de.res$logFC > 0 & de.res$Sig == 1] <- 1
+
+de.res$gene_id <- rownames(de.res)
+de.merge <- merge(de.res, gene_symbol,
+                  by.x='gene_id', by.y='ensembl_gene_id', all.x=TRUE)
+gene.top <- de.merge$external_gene_name
+gene.top[de.merge$logFC > -2 & de.merge$logFC < 2] <- ""
+gene.top[is.na(gene.top)] <- ""
+gene.top[de.merge$gene_id == "eGFP"] <- "GFP"
+
+write.table(de.merge,
+            file="~/Dropbox/Adipose/Adipose-DEgenes_GFP.tsv",
+            sep="\t", quote=F)
+
+knitr::kable(sum.res)
+```
+
+
+```{r, echo=FALSE, fig.height=4.5, fig.width=6.5}
+gfp.ma <- ggplot(de.merge, aes(x=AveExpr, y=logFC, colour=Sig)) +
+  geom_point(size=1, alpha=0.6, aes(x=AveExpr, y=logFC),
+             data=de.merge[de.merge$Sig == 0, ]) +
+  geom_point(size=1, alpha=0.9, aes(x=AveExpr, y=logFC),
+             data=de.merge[de.merge$Sig == 1, ]) +
+  theme_mike() +
+  scale_colour_manual(values=c("#696969", "#CF0000"), labels=c("notDE", "DE")) +
+  labs(x=expression(paste("Mean log"[2], " Expression")),
+       y=expression(paste("log"[2], " Fold Change"))) +
+  guides('colour'=guide_legend(title="Statistically significant")) +
+  ylim(c(-3, 3)) +
+  geom_text_repel(aes(label=gene.top),
+                  colour='black',
+                  nudge_x=0.15,
+                  nudge_y=0.5)
+
+ggsave(gfp.ma,
+       filename="~/Dropbox/Reports_Adipose/Adipogenesis2017/Figures/GFP_DE-MAplot.png",
+       height=4.5, width=6.5, dpi=300)
+```
+
+
+The labelled genes that are differentially expressed between the GFP+ve and -ve are those with a log$_2$ fold change > 2 or < -2.  Interestingly _Wt1_ is one of the top most upregulated genes in the GFP+ cells as we should expect; it is just not a binary state of on/off between these cells.  Generally speaking the fold changes are quite small, but they might be biologically informative, let's take a look to see if they fall into discrete clusters of genes, and if we can discern any kind of enriched functional terms from them.
+
+### Clustering of GFP DE genes
+
+```{r, echo=FALSE}
+library(WGCNA)
+gfp.genes <- de.merge$gene_id[de.merge$Sig != 0]
+
+gfp.exprs <- adipose.nz[gfp.genes, -ncol(adipose.nz)]
+gfp.cor <- cor(t(gfp.exprs), method='spearman')
+gfp.dist <- as.dist(abs(gfp.cor - 1))
+gfp.clust <- flashClust(gfp.dist, method="average")
+gfp.cut <- cutreeDynamicTree(gfp.clust, deepSplit=TRUE, minModuleSize=30)
+gfp.cols <- labels2colors(gfp.cut)
+
+gfp.annot <- data.frame(cbind(gfp.cols))
+rownames(gfp.annot) <- gfp.genes
+colnames(gfp.annot) <- c("Cluster")
+gfp.annot$Cluster <- as.character(gfp.annot$Cluster)
+
+gfp.colors <- col2hcl(unique(gfp.cols))
+names(gfp.colors) <- unique(gfp.cols)
+
+pheatmap(gfp.cor,
+         show_colnames=FALSE, show_rownames=FALSE,
+         cluster_rows=TRUE, cluster_cols=TRUE,
+         annotation_col=gfp.annot,
+         annotation_colors=list(Cluster=gfp.colors),
+         clustering_distance_rows=gfp.dist,
+         clustering_distance_cols=gfp.dist,
+         clustering_method="average")
+```
+
+There are 8 reasonably well defined cluster of genes here, I might argue that they can be merged into may 4-5 clusters.  If there is no enrichments then I will merge together the highly similar ones.
+
+### Functional enrichment testing of GFP DE genes
+First let's see what the enrichment is across all GFP+ve DE genes, then the individual clusters.
+
+```{r, echo=FALSE, fig.height=5.5, fig.width=12.5}
+# use goseq
+# use GO enrichment to test for specific pathways and function
+# if there are enriched terms, this would at least imply some
+# similar functional connection
+# big cluster first
+all.genes <- unique(rownames(adipose.nz))
+gfp.pos.genes <- de.merge$gene_id[de.merge$Sig != 0 & de.merge$Diff == 1]
+
+gene.tpm <- read.table("~/Dropbox/Thymus/mTEC_1_01.quant", sep="\t",
+                       h=T, stringsAsFactors=F)
+gene.length <- gene.tpm$Length[unique(gene.tpm$Name) %in% all.genes]
+names(gene.length) <- intersect(unique(gene.tpm$Name) , all.genes)
+
+de.big.vector <- as.integer(unique(all.genes) %in% unique(gfp.pos.genes))
+names(de.big.vector) <- unique(all.genes)
+
+de.big.vector <- de.big.vector[intersect(names(de.big.vector), names(gene.length))]
+
+pwf.all <- nullp(de.big.vector, "mm10", "ensGene", bias.data=gene.length[intersect(names(de.big.vector), names(gene.length))],
+                 plot.fit=FALSE)
+GO.wall.all <- goseq(pwf.all, genome="mm10", id="ensGene", test.cats=c("GO:BP"),
+                      method="Wallenius", use_genes_without_cat=T)
+
+GO.wall.all$padjust <- p.adjust(GO.wall.all$over_represented_pvalue, method="BH")
+GO.wall.all$foldEnrich <- ((GO.wall.all$numDEInCat/length(unique(gfp.pos.genes)))/(GO.wall.all$numInCat/length(gene.length)))
+
+# select on p-value and foldEnrich
+GO.sig.all <- GO.wall.all[(GO.wall.all$padjust <= 0.001), ]
+go_cats.all <- data.frame(GO.sig.all$category, GO.sig.all$foldEnrich)
+
+p.enrich <- ggplot(GO.sig.all,
+                   aes(x=foldEnrich, y=-log10(padjust), colour=-log10(padjust),
+                       size=foldEnrich)) +
+  geom_point() + theme_mike() +
+  scale_colour_gradient(low="#000000", high="#DC143C")
+
+GO.all <- GO.sig.all[order(GO.sig.all$padjust, decreasing=FALSE), ]
+gppos.GO.all <- GO.sig.all[order(GO.sig.all$padjust, decreasing=FALSE), ]
+
+p.terms <- ggplot(na.omit(GO.all[1:5, ]),
+                  aes(x=reorder(term, 
+                                foldEnrich),
+           y=foldEnrich,
+           fill=-log10(padjust))) +
+  scale_fill_distiller(palette="Reds", direction=1) +
+  geom_bar(stat='identity') + theme_mike() +
+  scale_x_discrete(labels=function(X) str_wrap(X, width=30)) +
+  coord_flip() + labs(x="Gene Ontology Term", y="Fold Enrichment")
+
+ggsave(p.terms,
+       filename="~/Dropbox/Reports_Adipose/Adipogenesis2017/Figures/GFPpos_DEgene_GOenrich.png",
+       height=4.25, width=6.75, dpi=300)
+
+plot_grid(p.enrich, p.terms, ncol=2, rel_widths=c(0.8, 1.2))
+```
+
+
+```{r, echo=FALSE, fig.height=5.5, fig.width=12.5}
+# use goseq
+# use GO enrichment to test for specific pathways and function
+# if there are enriched terms, this would at least imply some
+# similar functional connection
+# big cluster first
+gfp.neg.genes <- de.merge$gene_id[de.merge$Sig != 0 & de.merge$Diff == -1]
+
+de.big.vector <- as.integer(unique(all.genes) %in% unique(gfp.neg.genes))
+names(de.big.vector) <- unique(all.genes)
+
+de.big.vector <- de.big.vector[intersect(names(de.big.vector), names(gene.length))]
+
+pwf.all <- nullp(de.big.vector, "mm10", "ensGene", bias.data=gene.length[intersect(names(de.big.vector), names(gene.length))],
+                 plot.fit=FALSE)
+GO.wall.all <- goseq(pwf.all, genome="mm10", id="ensGene", test.cats=c("GO:BP"),
+                      method="Wallenius", use_genes_without_cat=T)
+
+GO.wall.all$padjust <- p.adjust(GO.wall.all$over_represented_pvalue, method="BH")
+GO.wall.all$foldEnrich <- ((GO.wall.all$numDEInCat/length(unique(gfp.neg.genes)))/(GO.wall.all$numInCat/length(gene.length)))
+
+# select on p-value and foldEnrich
+GO.sig.all <- GO.wall.all[(GO.wall.all$padjust <= 0.01), ]
+go_cats.all <- data.frame(GO.sig.all$category, GO.sig.all$foldEnrich)
+
+p.enrich <- ggplot(GO.sig.all,
+                   aes(x=foldEnrich, y=-log10(padjust), colour=-log10(padjust),
+                       size=foldEnrich)) +
+  geom_point() + theme_mike() +
+  scale_colour_gradient(low="#000000", high="#DC143C")
+
+GO.all <- GO.sig.all[order(GO.sig.all$padjust, decreasing=FALSE), ]
+gpneg.GO.all <- GO.sig.all[order(GO.sig.all$padjust, decreasing=FALSE), ]
+
+p.terms <- ggplot(na.omit(GO.all[1:5, ]),
+                  aes(x=reorder(term, 
+                                foldEnrich),
+           y=foldEnrich,
+           fill=-log10(padjust))) +
+  scale_fill_distiller(palette="Reds", direction=1) +
+  geom_bar(stat='identity') + theme_mike() +
+  scale_x_discrete(labels=function(X) str_wrap(X, width=50)) +
+  coord_flip() + labs(x="Gene Ontology Term", y="Fold Enrichment")
+
+ggsave(p.terms,
+       filename="~/Dropbox/Reports_Adipose/Adipogenesis2017/Figures/GFPneg_DEgene_GOenrich.png",
+       height=4.25, width=6.75, dpi=300)
+
+plot_grid(p.enrich, p.terms, ncol=2, rel_widths=c(0.8, 1.2))
+```
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.width=6.75, fig.height=4.75}
+# put both GFP+ and GFP- enriched terms in a single plot
+gpneg.GO.all$Condition <- "GFP-"
+gppos.GO.all$Condition <- "GFP+"
+
+gfpall.GO <- do.call(rbind.data.frame,
+                     list("GFP+"=gppos.GO.all[1:5, ],
+                          "GFP-"=gpneg.GO.all[1:5, ]))
+
+gfp.terms <- ggplot(na.omit(gfpall.GO),
+                    aes(x=reorder(term, 
+                                  foldEnrich),
+           y=foldEnrich,
+           fill=-log10(padjust))) +
+  scale_fill_distiller(palette="Reds", direction=1) +
+  geom_bar(stat='identity') + theme_mike() +
+  scale_x_discrete(labels=function(X) str_wrap(X, width=50)) +
+  coord_flip() + labs(x="Gene Ontology Term", y="Fold Enrichment") +
+  facet_wrap(~Condition, ncol=1, scales="free_y") +
+  theme(strip.background = element_blank())
+
+ggsave(gfp.terms,
+       filename="~/Dropbox/Reports_Adipose/Adipogenesis2017/Figures/GFP_DE_GOenrich.png",
+       height=4.75, width=6.75, dpi=300)
+```
+
+
+
+#### Yellow cluster
+
+```{r, echo=FALSE, fig.height=5.5, fig.width=12.5}
+# use goseq
+# use GO enrichment to test for specific pathways and function
+# if there are enriched terms, this would at least imply some
+# similar functional connection
+# big cluster first
+all.genes <- unique(rownames(adipose.nz))
+
+yellow.genes <- rownames(gfp.annot)[gfp.annot$Cluster %in% c("yellow")]
+blue.genes <- rownames(gfp.annot)[gfp.annot$Cluster %in% c("blue")]
+green.genes <- rownames(gfp.annot)[gfp.annot$Cluster %in% c("green")]
+brown.genes <- rownames(gfp.annot)[gfp.annot$Cluster %in% c("brown")]
+black.genes <- rownames(gfp.annot)[gfp.annot$Cluster %in% c("black")]
+turquoise.genes <- rownames(gfp.annot)[gfp.annot$Cluster %in% c("turquoise")]
+pink.genes <- rownames(gfp.annot)[gfp.annot$Cluster %in% c("pink")]
+red.genes <- rownames(gfp.annot)[gfp.annot$Cluster %in% c("red")]
+
+gene.tpm <- read.table("~/Dropbox/Thymus/mTEC_1_01.quant", sep="\t",
+                       h=T, stringsAsFactors=F)
+gene.length <- gene.tpm$Length[unique(gene.tpm$Name) %in% all.genes]
+names(gene.length) <- intersect(unique(gene.tpm$Name) , all.genes)
+
+de.big.vector <- as.integer(unique(all.genes) %in% unique(yellow.genes))
+names(de.big.vector) <- unique(all.genes)
+
+de.big.vector <- de.big.vector[intersect(names(de.big.vector), names(gene.length))]
+
+pwf.all <- nullp(de.big.vector, "mm10", "ensGene", bias.data=gene.length[intersect(names(de.big.vector), names(gene.length))],
+                 plot.fit=FALSE)
+GO.wall.all <- goseq(pwf.all, genome="mm10", id="ensGene", test.cats=c("GO:BP"),
+                      method="Wallenius", use_genes_without_cat=T)
+
+GO.wall.all$padjust <- p.adjust(GO.wall.all$over_represented_pvalue, method="BH")
+GO.wall.all$foldEnrich <- ((GO.wall.all$numDEInCat/length(unique(yellow.genes)))/(GO.wall.all$numInCat/length(gene.length)))
+
+# select on p-value and foldEnrich
+GO.sig.all <- GO.wall.all[(GO.wall.all$padjust <= 0.01), ]
+go_cats.all <- data.frame(GO.sig.all$category, GO.sig.all$foldEnrich)
+
+p.enrich <- ggplot(GO.sig.all,
+                   aes(x=foldEnrich, y=-log10(padjust), colour=-log10(padjust),
+                       size=foldEnrich)) +
+  geom_point() + theme_mike() +
+  scale_colour_gradient(low="#000000", high="#DC143C")
+
+GO.all <- GO.sig.all[order(GO.sig.all$padjust, decreasing=FALSE), ]
+
+p.terms <- ggplot(na.omit(GO.all[1:20, ]),
+                  aes(x=reorder(term, 
+                                foldEnrich),
+           y=foldEnrich,
+           fill=-log10(padjust))) +
+  scale_fill_distiller(palette="Reds", direction=1) +
+  geom_bar(stat='identity') + theme_mike() +
+  scale_x_discrete(labels=function(X) str_wrap(X, width=50)) +
+  coord_flip() + labs(x="Gene Ontology Term", y="Fold Enrichment")
+
+plot_grid(p.enrich, p.terms, ncol=2, rel_widths=c(0.8, 1.2))
+```
+
+It would seem that some of the cells are actively undergoing migration, ECM remodelling and morphological changes.  What direction of expression are these changes?  i.e. is this a feature of the GFP+ cells specifically?
+
+```{r, echo=FALSE, , echo=FALSE, fig.height=4.5, fig.width=5.5}
+mark.order <- adipose.uber$Sample[order(adipose.uber$Marker)]
+cluster.order <- adipose.uber$Sample[order(adipose.uber$Cluster)]
+annot.df <- data.frame(cbind(adipose.uber[, c("Cluster", "Marker")]))
+colnames(annot.df) <- c("CellCluster", "Marker")
+annot.df$CellCluster <- as.factor(annot.df$CellCluster)
+annot.df$Marker <- as.factor(annot.df$Marker)
+rownames(annot.df) <- adipose.uber$Sample
+gfp.cols <- c("#386cb0", "#fdb462")
+names(gfp.cols) <- c("GFP+", "GFP-")
+
+cluster.cols <- col2hcl(unique(annot.df$CellCluster))
+names(cluster.cols) <- unique(annot.df$CellCluster)
+
+#adipose.nz <- adipose.nz[, -ncol(adipose.nz)]
+pheatmap(adipose.nz[yellow.genes, mark.order],
+         show_rownames=FALSE, show_colnames=FALSE,
+         cluster_cols=FALSE, annotation_col=annot.df,
+         annotation_colors=list(CellCluster=cluster.cols,
+                                Marker=gfp.cols))
+
+```
+
+Most of these genes are up-regulated in the GFP+ cells, albeit quite subtly, which suggests these cells are more active in their morphological changes perhaps.
+
+#### Blue cluster
+
+```{r, echo=FALSE, fig.height=5.5, fig.width=12.5}
+de.big.vector <- as.integer(unique(all.genes) %in% unique(blue.genes))
+names(de.big.vector) <- unique(all.genes)
+
+de.big.vector <- de.big.vector[intersect(names(de.big.vector), names(gene.length))]
+
+pwf.all <- nullp(de.big.vector, "mm10", "ensGene", bias.data=gene.length[intersect(names(de.big.vector), names(gene.length))],
+                 plot.fit=FALSE)
+GO.wall.all <- goseq(pwf.all, genome="mm10", id="ensGene", test.cats=c("GO:BP"),
+                      method="Wallenius", use_genes_without_cat=T)
+
+GO.wall.all$padjust <- p.adjust(GO.wall.all$over_represented_pvalue, method="BH")
+GO.wall.all$foldEnrich <- ((GO.wall.all$numDEInCat/length(unique(blue.genes)))/(GO.wall.all$numInCat/length(gene.length)))
+
+# select on p-value and foldEnrich
+GO.sig.all <- GO.wall.all[(GO.wall.all$padjust <= 0.01), ]
+go_cats.all <- data.frame(GO.sig.all$category, GO.sig.all$foldEnrich)
+
+p.enrich <- ggplot(GO.sig.all,
+                   aes(x=foldEnrich, y=-log10(padjust), colour=-log10(padjust),
+                       size=foldEnrich)) +
+  geom_point() + theme_mike() +
+  scale_colour_gradient(low="#000000", high="#DC143C")
+
+GO.all <- GO.sig.all[order(GO.sig.all$padjust, decreasing=FALSE), ]
+
+p.terms <- ggplot(na.omit(GO.all[1:20, ]),
+                  aes(x=reorder(term, 
+                                foldEnrich),
+           y=foldEnrich,
+           fill=-log10(padjust))) +
+  scale_fill_distiller(palette="Reds", direction=1) +
+  geom_bar(stat='identity') + theme_mike() +
+  scale_x_discrete(labels=function(X) str_wrap(X, width=50)) +
+  coord_flip() + labs(x="Gene Ontology Term", y="Fold Enrichment")
+
+plot_grid(p.enrich, p.terms, ncol=2, rel_widths=c(0.8, 1.2))
+```
+
+These terms also indicate there is active morphological changes occuring in the GFP+ cells compared to the GFP-.
+
+
+```{r, echo=FALSE, , echo=FALSE, fig.height=4.5, fig.width=5.5}
+pheatmap(adipose.nz[blue.genes, mark.order],
+         show_rownames=FALSE, show_colnames=FALSE,
+         cluster_cols=FALSE, annotation_col=annot.df,
+         annotation_colors=list(CellCluster=cluster.cols,
+                                Marker=gfp.cols))
+
+```
+
+These differences are quite hard to pick out visually, but there seems to be a general down-regulation of these particular genes in the GFP+ cells.  Perhaps this is driven by differences in the proportions of the different cell clusters between the GFP+ and GFP- cells?  That would perhaps be more likely to explain these changes than whether they are strictly GFP+/- cells perhaps?
+
+
+#### Green cluster
+
+```{r, echo=FALSE, fig.height=5.5, fig.width=12.5}
+de.big.vector <- as.integer(unique(all.genes) %in% unique(green.genes))
+names(de.big.vector) <- unique(all.genes)
+
+de.big.vector <- de.big.vector[intersect(names(de.big.vector), names(gene.length))]
+
+pwf.all <- nullp(de.big.vector, "mm10", "ensGene", bias.data=gene.length[intersect(names(de.big.vector), names(gene.length))],
+                 plot.fit=FALSE)
+GO.wall.all <- goseq(pwf.all, genome="mm10", id="ensGene", test.cats=c("GO:BP"),
+                      method="Wallenius", use_genes_without_cat=T)
+
+GO.wall.all$padjust <- p.adjust(GO.wall.all$over_represented_pvalue, method="BH")
+GO.wall.all$foldEnrich <- ((GO.wall.all$numDEInCat/length(unique(green.genes)))/(GO.wall.all$numInCat/length(gene.length)))
+
+# select on p-value and foldEnrich
+GO.sig.all <- GO.wall.all[(GO.wall.all$padjust <= 0.01), ]
+go_cats.all <- data.frame(GO.sig.all$category, GO.sig.all$foldEnrich)
+
+p.enrich <- ggplot(GO.sig.all,
+                   aes(x=foldEnrich, y=-log10(padjust), colour=-log10(padjust),
+                       size=foldEnrich)) +
+  geom_point() + theme_mike() +
+  scale_colour_gradient(low="#000000", high="#DC143C")
+
+GO.all <- GO.sig.all[order(GO.sig.all$padjust, decreasing=FALSE), ]
+
+p.terms <- ggplot(na.omit(GO.all[1:20, ]),
+                  aes(x=reorder(term, 
+                                foldEnrich),
+           y=foldEnrich,
+           fill=-log10(padjust))) +
+  scale_fill_distiller(palette="Reds", direction=1) +
+  geom_bar(stat='identity') + theme_mike() +
+  scale_x_discrete(labels=function(X) str_wrap(X, width=50)) +
+  coord_flip() + labs(x="Gene Ontology Term", y="Fold Enrichment")
+
+plot_grid(p.enrich, p.terms, ncol=2, rel_widths=c(0.8, 1.2))
+```
+
+The lack of enrichment might be due to the ill-defined nature of this cluster; it might be better served merging with another cluster of genes.
+
+```{r, echo=FALSE, , echo=FALSE, fig.height=4.5, fig.width=5.5}
+pheatmap(adipose.nz[green.genes, cluster.order],
+         show_rownames=FALSE, show_colnames=FALSE,
+         cluster_cols=FALSE, annotation_col=annot.df,
+         annotation_colors=list(CellCluster=cluster.cols,
+                                Marker=gfp.cols))
+```
+
+I've plotted this one based on the ordering of the cell clusters, and we can see that there are no really distinct clusters based on these genes.
+
+#### Brown cluster
+
+```{r, echo=FALSE, fig.height=5.5, fig.width=12.5}
+de.big.vector <- as.integer(unique(all.genes) %in% unique(brown.genes))
+names(de.big.vector) <- unique(all.genes)
+
+de.big.vector <- de.big.vector[intersect(names(de.big.vector), names(gene.length))]
+
+pwf.all <- nullp(de.big.vector, "mm10", "ensGene", bias.data=gene.length[intersect(names(de.big.vector), names(gene.length))],
+                 plot.fit=FALSE)
+GO.wall.all <- goseq(pwf.all, genome="mm10", id="ensGene", test.cats=c("GO:BP"),
+                      method="Wallenius", use_genes_without_cat=T)
+
+GO.wall.all$padjust <- p.adjust(GO.wall.all$over_represented_pvalue, method="BH")
+GO.wall.all$foldEnrich <- ((GO.wall.all$numDEInCat/length(unique(brown.genes)))/(GO.wall.all$numInCat/length(gene.length)))
+
+# select on p-value and foldEnrich
+GO.sig.all <- GO.wall.all[(GO.wall.all$padjust <= 0.01), ]
+go_cats.all <- data.frame(GO.sig.all$category, GO.sig.all$foldEnrich)
+
+p.enrich <- ggplot(GO.sig.all,
+                   aes(x=foldEnrich, y=-log10(padjust), colour=-log10(padjust),
+                       size=foldEnrich)) +
+  geom_point() + theme_mike() +
+  scale_colour_gradient(low="#000000", high="#DC143C")
+
+GO.all <- GO.sig.all[order(GO.sig.all$padjust, decreasing=FALSE), ]
+
+p.terms <- ggplot(na.omit(GO.all[1:20, ]),
+                  aes(x=reorder(term, 
+                                foldEnrich),
+           y=foldEnrich,
+           fill=-log10(padjust))) +
+  scale_fill_distiller(palette="Reds", direction=1) +
+  geom_bar(stat='identity') + theme_mike() +
+  scale_x_discrete(labels=function(X) str_wrap(X, width=50)) +
+  coord_flip() + labs(x="Gene Ontology Term", y="Fold Enrichment")
+
+plot_grid(p.enrich, p.terms, ncol=2, rel_widths=c(0.8, 1.2))
+```
+
+That is a very strong enrichment for genes relating to ribosome production and translation.  These cells are definitely becoming more metabolically active!
+
+
+```{r, echo=FALSE, , echo=FALSE, fig.height=4.5, fig.width=5.5}
+pheatmap(adipose.nz[brown.genes, mark.order],
+         show_rownames=FALSE, show_colnames=FALSE,
+         cluster_cols=FALSE, annotation_col=annot.df,
+         annotation_colors=list(CellCluster=cluster.cols,
+                                Marker=gfp.cols))
+```
+
+It is not entirely clear where these differences are being driven from; there is a very similar picture if the heatmap is ordered by the cell clusters.  Perhaps there is one cluster that has slightly lower levels of these genes?
+
+#### Black cluster
+
+```{r, echo=FALSE, fig.height=5.5, fig.width=12.5}
+de.big.vector <- as.integer(unique(all.genes) %in% unique(black.genes))
+names(de.big.vector) <- unique(all.genes)
+
+de.big.vector <- de.big.vector[intersect(names(de.big.vector), names(gene.length))]
+
+pwf.all <- nullp(de.big.vector, "mm10", "ensGene", bias.data=gene.length[intersect(names(de.big.vector), names(gene.length))],
+                 plot.fit=FALSE)
+GO.wall.all <- goseq(pwf.all, genome="mm10", id="ensGene", test.cats=c("GO:BP"),
+                      method="Wallenius", use_genes_without_cat=T)
+
+GO.wall.all$padjust <- p.adjust(GO.wall.all$over_represented_pvalue, method="BH")
+GO.wall.all$foldEnrich <- ((GO.wall.all$numDEInCat/length(unique(black.genes)))/(GO.wall.all$numInCat/length(gene.length)))
+
+# select on p-value and foldEnrich
+GO.sig.all <- GO.wall.all[(GO.wall.all$padjust <= 0.01), ]
+go_cats.all <- data.frame(GO.sig.all$category, GO.sig.all$foldEnrich)
+
+p.enrich <- ggplot(GO.sig.all,
+                   aes(x=foldEnrich, y=-log10(padjust), colour=-log10(padjust),
+                       size=foldEnrich)) +
+  geom_point() + theme_mike() +
+  scale_colour_gradient(low="#000000", high="#DC143C")
+
+GO.all <- GO.sig.all[order(GO.sig.all$padjust, decreasing=FALSE), ]
+
+p.terms <- ggplot(na.omit(GO.all[1:20, ]),
+                  aes(x=reorder(term, 
+                                foldEnrich),
+           y=foldEnrich,
+           fill=-log10(padjust))) +
+  scale_fill_distiller(palette="Reds", direction=1) +
+  geom_bar(stat='identity') + theme_mike() +
+  scale_x_discrete(labels=function(X) str_wrap(X, width=50)) +
+  coord_flip() + labs(x="Gene Ontology Term", y="Fold Enrichment")
+
+plot_grid(p.enrich, p.terms, ncol=2, rel_widths=c(0.8, 1.2))
+```
+
+Brown fat cell differentiation?  I suspect it is just a subset of the fat cell differentiation more generally.
+
+
+```{r, echo=FALSE, , echo=FALSE, fig.height=4.5, fig.width=5.5}
+pheatmap(adipose.nz[black.genes, cluster.order],
+         show_rownames=FALSE, show_colnames=FALSE,
+         cluster_cols=FALSE, annotation_col=annot.df,
+         annotation_colors=list(CellCluster=cluster.cols,
+                                Marker=gfp.cols))
+```
+
+If you squint it looks like there is stronger expression of 50% of these genes in the black and red cells compared to the green and blue cells.
+
+#### Turquoise cluster
+
+```{r, echo=FALSE, fig.height=5.5, fig.width=12.5}
+de.big.vector <- as.integer(unique(all.genes) %in% unique(turquoise.genes))
+names(de.big.vector) <- unique(all.genes)
+
+de.big.vector <- de.big.vector[intersect(names(de.big.vector), names(gene.length))]
+
+pwf.all <- nullp(de.big.vector, "mm10", "ensGene", bias.data=gene.length[intersect(names(de.big.vector), names(gene.length))],
+                 plot.fit=FALSE)
+GO.wall.all <- goseq(pwf.all, genome="mm10", id="ensGene", test.cats=c("GO:BP"),
+                      method="Wallenius", use_genes_without_cat=T)
+
+GO.wall.all$padjust <- p.adjust(GO.wall.all$over_represented_pvalue, method="BH")
+GO.wall.all$foldEnrich <- ((GO.wall.all$numDEInCat/length(unique(turquoise.genes)))/(GO.wall.all$numInCat/length(gene.length)))
+
+# select on p-value and foldEnrich
+GO.sig.all <- GO.wall.all[(GO.wall.all$padjust <= 0.01), ]
+go_cats.all <- data.frame(GO.sig.all$category, GO.sig.all$foldEnrich)
+
+p.enrich <- ggplot(GO.sig.all,
+                   aes(x=foldEnrich, y=-log10(padjust), colour=-log10(padjust),
+                       size=foldEnrich)) +
+  geom_point() + theme_mike() +
+  scale_colour_gradient(low="#000000", high="#DC143C")
+
+GO.all <- GO.sig.all[order(GO.sig.all$padjust, decreasing=FALSE), ]
+
+p.terms <- ggplot(na.omit(GO.all[1:20, ]),
+                  aes(x=reorder(term, 
+                                foldEnrich),
+           y=foldEnrich,
+           fill=-log10(padjust))) +
+  scale_fill_distiller(palette="Reds", direction=1) +
+  geom_bar(stat='identity') + theme_mike() +
+  scale_x_discrete(labels=function(X) str_wrap(X, width=50)) +
+  coord_flip() + labs(x="Gene Ontology Term", y="Fold Enrichment")
+
+plot_grid(p.enrich, p.terms, ncol=2, rel_widths=c(0.8, 1.2))
+```
+
+No enrichments.
+
+```{r, echo=FALSE, , echo=FALSE, fig.height=4.5, fig.width=5.5}
+pheatmap(adipose.nz[turquoise.genes, cluster.order],
+         show_rownames=FALSE, show_colnames=FALSE,
+         cluster_cols=FALSE, annotation_col=annot.df,
+         annotation_colors=list(CellCluster=cluster.cols,
+                                Marker=gfp.cols))
+```
+
+We can see that the expression here is largely concentrated in the red clusters of cells.
+
+#### Pink cluster
+
+```{r, echo=FALSE, fig.height=5.5, fig.width=12.5}
+de.big.vector <- as.integer(unique(all.genes) %in% unique(pink.genes))
+names(de.big.vector) <- unique(all.genes)
+
+de.big.vector <- de.big.vector[intersect(names(de.big.vector), names(gene.length))]
+
+pwf.all <- nullp(de.big.vector, "mm10", "ensGene", bias.data=gene.length[intersect(names(de.big.vector), names(gene.length))],
+                 plot.fit=FALSE)
+GO.wall.all <- goseq(pwf.all, genome="mm10", id="ensGene", test.cats=c("GO:BP"),
+                      method="Wallenius", use_genes_without_cat=T)
+
+GO.wall.all$padjust <- p.adjust(GO.wall.all$over_represented_pvalue, method="BH")
+GO.wall.all$foldEnrich <- ((GO.wall.all$numDEInCat/length(unique(pink.genes)))/(GO.wall.all$numInCat/length(gene.length)))
+
+# select on p-value and foldEnrich
+GO.sig.all <- GO.wall.all[(GO.wall.all$padjust <= 0.01), ]
+go_cats.all <- data.frame(GO.sig.all$category, GO.sig.all$foldEnrich)
+
+p.enrich <- ggplot(GO.sig.all,
+                   aes(x=foldEnrich, y=-log10(padjust), colour=-log10(padjust),
+                       size=foldEnrich)) +
+  geom_point() + theme_mike() +
+  scale_colour_gradient(low="#000000", high="#DC143C")
+
+GO.all <- GO.sig.all[order(GO.sig.all$padjust, decreasing=FALSE), ]
+
+p.terms <- ggplot(na.omit(GO.all[1:20, ]),
+                  aes(x=reorder(term, 
+                                foldEnrich),
+           y=foldEnrich,
+           fill=-log10(padjust))) +
+  scale_fill_distiller(palette="Reds", direction=1) +
+  geom_bar(stat='identity') + theme_mike() +
+  scale_x_discrete(labels=function(X) str_wrap(X, width=50)) +
+  coord_flip() + labs(x="Gene Ontology Term", y="Fold Enrichment")
+
+plot_grid(p.enrich, p.terms, ncol=2, rel_widths=c(0.8, 1.2))
+```
+
+No enrichments, this often happens with small clusters as there is insufficient power to detect any enriched terms.
+
+
+```{r, echo=FALSE, , echo=FALSE, fig.height=4.5, fig.width=5.5}
+pheatmap(adipose.nz[pink.genes, cluster.order],
+         show_rownames=FALSE, show_colnames=FALSE,
+         cluster_cols=FALSE, annotation_col=annot.df,
+         annotation_colors=list(CellCluster=cluster.cols,
+                                Marker=gfp.cols))
+```
+
+To be honest the differences here are very subtle, and look like they are confinded largel to the red cluster of cells.
+
+#### Red cluster
+
+```{r, echo=FALSE, fig.height=5.5, fig.width=12.5}
+de.big.vector <- as.integer(unique(all.genes) %in% unique(red.genes))
+names(de.big.vector) <- unique(all.genes)
+
+de.big.vector <- de.big.vector[intersect(names(de.big.vector), names(gene.length))]
+
+pwf.all <- nullp(de.big.vector, "mm10", "ensGene", bias.data=gene.length[intersect(names(de.big.vector), names(gene.length))],
+                 plot.fit=FALSE)
+GO.wall.all <- goseq(pwf.all, genome="mm10", id="ensGene", test.cats=c("GO:BP"),
+                      method="Wallenius", use_genes_without_cat=T)
+
+GO.wall.all$padjust <- p.adjust(GO.wall.all$over_represented_pvalue, method="BH")
+GO.wall.all$foldEnrich <- ((GO.wall.all$numDEInCat/length(unique(red.genes)))/(GO.wall.all$numInCat/length(gene.length)))
+
+# select on p-value and foldEnrich
+GO.sig.all <- GO.wall.all[(GO.wall.all$padjust <= 0.01), ]
+go_cats.all <- data.frame(GO.sig.all$category, GO.sig.all$foldEnrich)
+
+p.enrich <- ggplot(GO.sig.all,
+                   aes(x=foldEnrich, y=-log10(padjust), colour=-log10(padjust),
+                       size=foldEnrich)) +
+  geom_point() + theme_mike() +
+  scale_colour_gradient(low="#000000", high="#DC143C")
+
+GO.all <- GO.sig.all[order(GO.sig.all$padjust, decreasing=FALSE), ]
+
+p.terms <- ggplot(na.omit(GO.all[1:20, ]),
+                  aes(x=reorder(term, 
+                                foldEnrich),
+           y=foldEnrich,
+           fill=-log10(padjust))) +
+  scale_fill_distiller(palette="Reds", direction=1) +
+  geom_bar(stat='identity') + theme_mike() +
+  scale_x_discrete(labels=function(X) str_wrap(X, width=50)) +
+  coord_flip() + labs(x="Gene Ontology Term", y="Fold Enrichment")
+
+plot_grid(p.enrich, p.terms, ncol=2, rel_widths=c(0.8, 1.2))
+```
+
+Only _very_ generic enriched terms.
+
+```{r, echo=FALSE, , echo=FALSE, fig.height=4.5, fig.width=5.5}
+pheatmap(adipose.nz[red.genes, cluster.order],
+         show_rownames=FALSE, show_colnames=FALSE,
+         cluster_cols=FALSE, annotation_col=annot.df,
+         annotation_colors=list(CellCluster=cluster.cols,
+                                Marker=gfp.cols))
+```
+
+These changes look they are more enriched in the blue cells, and quite depleted in the red cells.
+
+## Conclusions
+
+Firstly, these cells all seem quite similar in high dimensional space from the tSNE plots, but it is possible to define some loose clustering of cells.  These might represent very subtle shifts in the transcriptomes of these cells as they develop, rather than representing discrete cell populations.  This fits with what we tend to know about differentiating cells, they form a continuum rather than discrete steps along some lineage.
+
+The next thing to mention is that the GFP status of cells does not seem to define them especially well.  Whilst _Wt1_ is up-regulated in the GFP+ cells, it is quite a subtle change, and I suspect with 25% of the number of cells here we would not detect any difference between them, or very few.  Looking at the clustering and functional enrichment testing of these differentially expressed genes we can infer that there are morphological and metabolic changes occuring in these cells.  It also seems that in some cases these changes are largely confined to particular groups of cells, rather than being a characteristic of the GFP expression.  This might indicate that these clusters represent fuzzy regions of differentiating cells that are more similar to each other.  In the next report I will try to infer a pseudotime trajectory and investigate what genes are differentially expressed along it's continuum.
